@@ -13,7 +13,10 @@ import yaml
 PROJECT = Path(__file__).resolve().parent.parent
 
 HCPCS_RE = re.compile(r"^[A-Z0-9]\d{3}[A-Z0-9]$")
-MONTH_TO_Q = {"january": 1, "april": 2, "july": 3, "october": 4}
+MONTH_TO_Q = {
+    "jan": 1, "january": 1, "apr": 2, "april": 2,
+    "jul": 3, "july": 3, "oct": 4, "october": 4,
+}
 
 
 def load_yaml(name: str) -> dict:
@@ -29,7 +32,22 @@ def paths() -> dict[str, Path]:
 
 
 def drugs_in_scope() -> list[dict]:
-    return load_yaml("drugs_in_scope.yaml")["drugs"]
+    """Read the generated, CMS-spend-ranked scope; never fall back to sample codes."""
+    scope_path = paths()["ref"] / "drug_scope.parquet"
+    if not scope_path.exists():
+        scope_path = scope_path.parent.parent / "processed_parquet_backup" / "ref" / "drug_scope.parquet"
+    if not scope_path.exists():
+        raise FileNotFoundError(
+            "Generated drug scope is missing. Add the CMS Part B Spending by Drug file under "
+            "data/raw_essential_inputs, then run python -m pipeline.run_all."
+        )
+    import polars as pl
+    rows = pl.read_parquet(scope_path).to_dicts()
+    return [{
+        **row,
+        "billing_unit": ({"qty": row["billing_qty"], "unit": row["billing_unit"]}
+                         if row.get("billing_qty") is not None and row.get("billing_unit") else None),
+    } for row in rows]
 
 
 def sha256(path: Path) -> str:
@@ -38,6 +56,16 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def write_sha256_sidecar(path: Path, digest: str | None = None) -> str:
+    """Persist a standard adjacent checksum file for an immutable raw input."""
+    value = digest or sha256(path)
+    sidecar = path.with_name(path.name + ".sha256")
+    temporary = sidecar.with_name(sidecar.name + ".part")
+    temporary.write_text(f"{value}  {path.name}\n", encoding="ascii")
+    os.replace(temporary, sidecar)
+    return value
 
 
 def rel(path: Path) -> str:
@@ -53,7 +81,7 @@ def rel(path: Path) -> str:
 def quarter_from_filename(name: str) -> str | None:
     """'october_2026_..._payment_limit...' -> '2026Q4'."""
     low = name.lower()
-    m = re.search(r"(january|april|july|october)[_\- ]?(20\d\d)", low)
+    m = re.search(r"(january|april|july|october|jan|apr|jul|oct)[_\- ]?(20\d\d)", low)
     if not m:
         return None
     return f"{m.group(2)}Q{MONTH_TO_Q[m.group(1)]}"

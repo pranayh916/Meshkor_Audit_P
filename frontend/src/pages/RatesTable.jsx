@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { csvUrl, fmt, getJSON, PRICE_TYPE_TEXT, STATUS_TEXT } from "../api.js";
 import { StatusPill } from "../components.jsx";
 
@@ -9,6 +9,7 @@ const PAYERS = ["", "Anthem", "UnitedHealthcare", "Aetna", "Cigna", "Medical Mut
 
 /** Server-side filtered, sorted, paged rate table with CSV export. */
 export default function RatesTable({ fixed = {} }) {
+  const [searchParams] = useSearchParams();
   const [f, setF] = useState({ price_type: "negotiated_dollar", status: "", payer_group: "", q: "" });
   const [sort, setSort] = useState({ sort: "markup_multiple", order: "desc" });
   const [offset, setOffset] = useState(0);
@@ -16,11 +17,13 @@ export default function RatesTable({ fixed = {} }) {
   const params = { ...fixed, ...f, ...sort };
   const key = JSON.stringify(params);
 
+  useEffect(() => { setF((old) => ({ ...old, q: searchParams.get("q") || "" })); }, [searchParams]);
+
   useEffect(() => { setOffset(0); }, [key]);
   useEffect(() => {
     let live = true;
     setRes((r) => ({ ...r, loading: true }));
-    getJSON("rates", { ...params, limit: PAGE, offset })
+    getJSON("hospital-drug-price-comparisons", { ...params, limit: PAGE, offset })
       .then((d) => live && setRes({ ...d, error: null, loading: false }))
       .catch((e) => live && setRes({ rows: [], total: 0, error: e, loading: false }));
     return () => { live = false; };
@@ -65,14 +68,14 @@ export default function RatesTable({ fixed = {} }) {
               {th("price", "Price", true)}
               <th className="num">Billing units</th>
               {th("price_per_billing_unit", "$ / unit", true)}
-              <th className="num">ASP+6%</th>
+              <th className="num">CMS ASP payment limit</th>
               {th("markup_multiple", "Markup", true)}
               {th("status", "Status")}
             </tr>
           </thead>
           <tbody>
             {res.rows.map((r, i) => (
-              <tr key={i} title={`${r.source_file} :: ${r.source_member}\nsha256 ${r.source_sha256}`}>
+              <tr key={i} title={`${r.source_file || ""} :: ${r.source_member || ""}`.trim()}>
                 <td><Link to={`/hospitals/${r.hospital_key}`}>{r.hospital_label}</Link>
                   <div className="muted">{r.setting || ""}</div></td>
                 {!fixed.hcpcs && <td><Link to={`/drugs/${r.hcpcs}`}>{r.hcpcs}</Link>

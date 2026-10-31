@@ -1,6 +1,6 @@
 # Paths are relative to the project folder (infusion-audit/).
 paths:
-  raw: data/raw
+  raw: data/raw_essential_inputs
   ref: data/ref          # reference tables (ASP, crosswalk)
   hpt_norm: data/hpt/norm  # normalized hospital drug rates
   mart: data/mart        # comparison table used by the API
@@ -13,14 +13,41 @@ review_range:
 
 # Benchmark quarter for each hospital file:
 #   file_date -> ASP quarter that contains the file's last_updated_on date
-#               (falls back to the latest loaded quarter)
+#               (does not fall back when that quarter is absent)
 #   latest    -> always the latest loaded ASP quarter
 benchmark_quarter: file_date
+
+# When a hospital prices per ML or per EA (vial), or posts no unit, read the
+# strength from the hospital's own description:
+#   "KEYTRUDA 25 MG/ML", 4 ML      -> 100 mg
+#   "REMICADE 100 MG", 1 EA        -> 100 mg
+#   "INJ DENOSUMAB 1 MG", no unit  -> 1 billing unit (only when the text equals
+#                                     the HCPCS billing unit)
+# Each such row is marked with unit_method so a reviewer can check it.
+units_from_description: true
 
 # Hospital rows that give no drug unit are NOT converted (status
 # unit_unresolved). Set true only after a reviewer confirms that a hospital
 # prices per one HCPCS billing unit.
 assume_hcpcs_unit_when_missing: false
+
+# Rows with status unit_ambiguous: the price fits the benchmark only if it is
+# per 1 HCPCS billing unit, not per package. List a system here ONLY after a
+# reviewer has checked sample rows for that system by hand. Those rows then
+# count as compared, marked unit_method = reviewer_per_billing_unit.
+#
+# Decision log:
+#   2026-10-23  cleveland_clinic, uh_cleveland accepted by the project lead after a
+#               50-row sample (reports/review_unit_ambiguous.csv). Medicare Advantage
+#               rates read per unit land at ~1.00x ASP+6%; per-vial reading gave
+#               impossible prices (e.g. Remicade 100 mg vial at $31).
+accept_per_billing_unit_reading:
+  - cleveland_clinic
+  - uh_cleveland
+
+# A payer + plan in one hospital file that posts the same dollar amount for this
+# many different drugs is not a drug price (flat case rate, cap or placeholder).
+flat_rate_min_drugs: 3
 
 # Hospital systems whose files are not parsed yet.
 skip_systems: []

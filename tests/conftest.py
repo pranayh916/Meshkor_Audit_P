@@ -25,7 +25,7 @@ def _zip_bytes(member: str, data: bytes) -> bytes:
 
 def _csv_text(rows) -> str:
     s = io.StringIO()
-    csv.writer(s).writerows(rows)
+    csv.writer(s, lineterminator="\n").writerows(rows)
     return s.getvalue()
 
 
@@ -121,10 +121,11 @@ JSON_FILE = {
 @pytest.fixture(scope="session")
 def data_root(tmp_path_factory) -> Path:
     root = tmp_path_factory.mktemp("ia_test_data")
-    raw = root / "data" / "raw"
+    raw = root / "data" / "raw_essential_inputs"
     (raw / "cms_asp" / "2026_Q4").mkdir(parents=True)
     (raw / "cms_asp" / "2026_Q3").mkdir(parents=True)
     (raw / "cms_crosswalk" / "2026_Q4").mkdir(parents=True)
+    (raw / "partb_spending").mkdir(parents=True)
 
     # Q4 as CSV with junk lines before the header (like real CMS files)
     q4 = _csv_text([DISCLAIMER, ["CPT codes copyright AMA"], [], ASP_HEADER, *ASP_Q4,
@@ -145,6 +146,16 @@ def data_root(tmp_path_factory) -> Path:
     xw = _csv_text([DISCLAIMER, XW_HEADER, *XW_Q4])
     (raw / "cms_crosswalk/2026_Q4/october_2026_asp_ndc_hcpcs_crosswalk_TEST.zip"
      ).write_bytes(_zip_bytes("crosswalk.csv", xw.encode()))
+    # TEST ONLY: production scope is selected from the real CMS Part B file.
+    partb = _csv_text([
+        ["HCPCS_Cd", "HCPCS_Desc", "Brnd_Name", "Gnrc_Name", "Tot_Spndng_2023"],
+        ["J9271", "Test description A", "Test brand A", "Test drug A", "500"],
+        ["J9299", "Test description B", "Test brand B", "Test drug B", "400"],
+        ["J2350", "Test description C", "Test brand C", "Test drug C", "300"],
+        ["J1745", "Test description D", "Test brand D", "Test drug D", "200"],
+        ["J0897", "Test description E", "Test brand E", "Test drug E", "100"],
+    ])
+    (raw / "partb_spending/medicare_part_b_spending_by_drug_TEST.csv").write_text(partb)
     # seasonal vaccine file must be ignored
     (raw / "cms_asp/2026_Q4/2026-2027-seasonal-vaccine-price-file-TEST.zip"
      ).write_bytes(_zip_bytes("v.csv", b"x"))
@@ -155,7 +166,11 @@ def data_root(tmp_path_factory) -> Path:
     (sysdir / "tall__aaaa1111.csv").write_text(_csv_text([*META, TALL_HEADER, *TALL_ROWS]))
     (sysdir / "wide__bbbb2222.csv").write_text(_csv_text([*META, WIDE_HEADER, *WIDE_ROWS]))
     (sysdir / "json__cccc3333.zip").write_bytes(
-        _zip_bytes("test_standardcharges.json", json.dumps(JSON_FILE).encode()))
+        _zip_bytes("test_standardcharges.json", b"\xef\xbb\xbf" + json.dumps(JSON_FILE).encode()))
+    missing_quarter = [["hospital_name", "last_updated_on", "version"],
+                       ["Test Missing Quarter Hospital", "2027-01-15", "2.2.0"],
+                       TALL_HEADER, TALL_ROWS[0]]
+    (sysdir / "missing_quarter__eeee5555.csv").write_text(_csv_text(missing_quarter))
     (sysdir / "half__dddd4444.csv.part").write_text("partial download - must be ignored")
     return root
 
@@ -163,8 +178,9 @@ def data_root(tmp_path_factory) -> Path:
 @pytest.fixture(scope="session")
 def built(data_root, monkeypatch_session):
     monkeypatch_session.setenv("IA_DATA_ROOT", str(data_root))
-    from pipeline import build_compare, load_asp, parse_hpt
+    from pipeline import build_compare, load_asp, parse_hpt, select_drugs
     assert load_asp.main() == 0
+    assert select_drugs.main() == 0
     assert parse_hpt.main() == 0
     assert build_compare.main() == 0
     return data_root

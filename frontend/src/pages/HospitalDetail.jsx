@@ -15,7 +15,11 @@ export default function HospitalDetail() {
             <h1>{d.hospital_label}</h1>
             <p className="lede">{d.system} · file dated {d.file_last_updated || "not stated"}</p>
             {d.locations && <p className="muted">Locations on this file: {d.locations}</p>}
-            <p className="muted mono">{d.source_file}<br />sha256 {d.source_sha256}</p>
+            {d.file_status && <p className={d.file_error ? "note error" : "muted"}>
+              File status: {d.file_status.replaceAll("_", " ")} · {d.items_scanned ?? 0} items scanned · {d.drug_rows ?? d.n_rows ?? 0} selected-drug rows
+              {d.file_error ? ` · ${d.file_error}` : ""}
+            </p>}
+            <p className="muted mono">{d.source_file}</p>
             <div className="status-row">
               {d.statuses.map((s) => (
                 <span key={s.status}><StatusPill status={s.status} /> {fmt.n(s.n)}</span>
@@ -32,7 +36,7 @@ export default function HospitalDetail() {
                 { key: "rates", label: "Rates", num: true },
                 { key: "median_price_per_unit", label: "Median $ / unit", num: true,
                   render: (r) => fmt.usd(r.median_price_per_unit) },
-                { key: "asp_payment_limit", label: "ASP+6%", num: true,
+                { key: "asp_payment_limit", label: "CMS ASP limit", num: true,
                   render: (r) => fmt.usd(r.asp_payment_limit) },
                 { key: "median_markup", label: "Median", num: true,
                   render: (r) => <b>{fmt.x(r.median_markup)}</b> },
@@ -42,7 +46,8 @@ export default function HospitalDetail() {
           </section>
           <section>
             <h2>Every rate in this file</h2>
-            <RatesTable fixed={{ hospital_key: key }} />
+            {d.n_rows === 0 ? <p className="note">This file has no comparison rows. See its import status above and the Data Quality page for details.</p>
+              : <RatesTable fixed={{ hospital_key: key }} />}
           </section>
         </>
       )}

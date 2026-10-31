@@ -1,0 +1,49 @@
+{
+  "title": "Ohio Infusion Drug Markup Audit",
+  "target_drug_count": 20,
+  "upload_max_bytes": 2147483648,
+  "upload_max_uncompressed_bytes": 5368709120,
+  "upload_max_archive_members": 100000,
+  "upload_max_compression_ratio": 1000,
+  "allowed_upload_extensions": [".csv", ".json", ".txt", ".xlsx", ".xls", ".zip"],
+  "selection_source": "partb_spending",
+  "headline_price_type": "negotiated_dollar",
+  "headline_status": "ok",
+  "review_field": "reviewed",
+  "required_inputs": [
+    {"key": "cms_asp", "label": "CMS ASP payment limits", "patterns": ["data/raw_essential_inputs/cms_asp/**/*.zip"], "purpose": "Quarterly Medicare benchmark"},
+    {"key": "cms_crosswalk", "label": "CMS NDC to HCPCS crosswalk", "patterns": ["data/raw_essential_inputs/cms_asp/**/*crosswalk*.zip", "data/raw_essential_inputs/cms_crosswalk/**/*"], "purpose": "NDC to HCPCS mapping"},
+    {"key": "fda_ndc", "label": "FDA NDC directory", "patterns": ["data/raw_essential_inputs/fda_ndc/**/*"], "purpose": "NDC product and package reference"},
+    {"key": "nadac", "label": "NADAC", "patterns": ["data/raw_essential_inputs/nadac/**/*.csv"], "purpose": "Public drug acquisition-cost reference; not plan reimbursement"},
+    {"key": "nppes", "label": "Provider registry", "patterns": ["data/raw_essential_inputs/nppes/**/*", "data/raw_essential_inputs/NPPES/**/*"], "purpose": "Provider identity and location"},
+    {"key": "hospital_enrollments", "label": "Hospital enrollments", "patterns": ["data/raw_essential_inputs/hospital_enrollments/**/*", "data/raw_essential_inputs/Hospital Enrollments/**/*"], "purpose": "Hospital identity and coverage"},
+    {"key": "partb_spending", "label": "Medicare Part B drug spending", "patterns": ["data/raw_essential_inputs/partb_spending/**/*", "data/raw_essential_inputs/**/*Part B Spending by Drug*.zip"], "purpose": "Rank drugs by spend and select the configured top set"},
+    {"key": "hospital_list", "label": "CMS Hospital General Information", "patterns": ["data/raw_essential_inputs/hospital_list/**/*"], "purpose": "Ohio acute-care hospital coverage frame"},
+    {"key": "hospital_mrf", "label": "Hospital machine-readable files", "patterns": ["data/raw_essential_inputs/hospital_mrf/**/*"], "purpose": "Ohio hospital negotiated rates"}
+  ],
+  "supplemental_inputs": [
+    {"key": "payer_files", "label": "Payer files", "patterns": ["data/raw_essential_inputs/payer_files/**/*"], "purpose": "Physician-office and independent infusion rates"},
+    {"key": "client_claims", "label": "Client claims extract", "patterns": ["data/raw_essential_inputs/client_claims/**/*"], "purpose": "Plan-specific utilization and savings"},
+    {"key": "unit_reviews", "label": "Manual unit reviews", "patterns": ["data/raw_essential_inputs/unit_reviews/**/*.csv"], "purpose": "Reviewer sign-off for selected drug billing units"}
+  ],
+  "method_notes": [
+    "A published hospital rate is not an employer claim or a utilization-weighted plan cost.",
+    "A unit error can create a false markup; each included drug requires manual unit review before external use.",
+    "Hospital acquisition cost is not observed. 340B discounts do not determine the amount an employer plan pays.",
+    "Site-of-care changes require a lower-cost in-network option, clinical suitability, and the treating clinician's agreement."
+  ],
+  "status_notes": {
+    "review_range": "Outside the configured review range; inspect before drawing a conclusion.",
+    "unit_unresolved": "Unit could not be established; excluded from the headline comparison.",
+    "missing_asp": "No ASP payment limit is loaded for the hospital file's quarter; no price comparison was calculated.",
+    "unit_ambiguous": "More than one unit interpretation is plausible; excluded from the headline comparison.",
+    "algorithm_only": "Contract algorithm or terms are present instead of a negotiated dollar amount.",
+    "not_drug_price": "The row was excluded as not representing a drug price."
+  },
+  "output_files": {
+    "report": "ohio_market_report_draft.md",
+    "sites": "ohio_hospital_by_drug.csv",
+    "sources": "ohio_report_sources.csv",
+    "dashboard_data": "dashboard_data.json"
+  }
+}

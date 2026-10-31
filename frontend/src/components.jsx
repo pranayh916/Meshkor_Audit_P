@@ -4,12 +4,11 @@ import { Bar, BarChart, CartesianGrid, Cell, ReferenceLine, ResponsiveContainer,
 import { STATUS_TEXT } from "./api.js";
 
 export function Loading({ state, children }) {
-  if (state.loading && !state.data) return <div className="note">Loading…</div>;
+  if (state.loading && !state.data) return <div className="loading-skeleton" aria-label="Loading data"><span /><span /><span /></div>;
   if (state.error) return (
     <div className="note error">
       <b>Could not load data.</b> {state.error.message}
-      <div>Start the API (<code>python manage.py runserver</code>) and run the pipeline
-        (<code>python -m pipeline.run_all</code>).</div>
+      <div>Check the API response and the latest import status under Data Sources.</div>
     </div>
   );
   return children(state.data);
@@ -34,8 +33,8 @@ export function Provisional({ reviewed }) {
   return (
     <div className="banner">
       <b>Not yet reviewed.</b> Unit conversion for this drug has no pharmacist sign-off.
-      Treat markups as provisional until <code>reviewed_by</code> is set in
-      <code> config/drugs_in_scope.yaml</code>.
+      Treat markups as provisional until a reviewer sign-off is recorded under
+      <code> data/raw_essential_inputs/unit_reviews/</code>.
     </div>
   );
 }
@@ -85,30 +84,55 @@ export function Table({ columns, rows, initialSort, empty = "No rows." }) {
 }
 
 /** Horizontal bars of markup multiple with a 1× (= Medicare) reference line. */
-export function MarkupBars({ rows, labelKey, valueKey = "median_markup", height }) {
+export function MarkupBars({ rows, labelKey, valueKey = "median_markup", height,
+  reviewRange = [] }) {
   const data = rows.filter((r) => r[valueKey] != null)
-    .map((r) => ({ name: r[labelKey], v: r[valueKey] }));
+    .sort((a, b) => (b[valueKey] || 0) - (a[valueKey] || 0))
+    .map((r) => ({
+      name: r[labelKey],
+      v: r[valueKey],
+      hcpcs: r.hcpcs,
+      rates: r.rates,
+      hospitals: r.hospitals_priced,
+    }));
   if (!data.length) return <div className="note">No compared rates to chart.</div>;
-  const h = height || Math.max(170, data.length * 34 + 60);
+  const h = height || Math.max(220, data.length * 36 + 60);
   const narrow = typeof window !== "undefined" && window.innerWidth < 640;
-  const yw = narrow ? 120 : 240;
-  const maxChars = narrow ? 16 : 36;
+  const yw = narrow ? 130 : 260;
+  const maxChars = narrow ? 16 : 38;
+
+  const CustomTooltip = ({ active, payload }) => {
+    if (active && payload && payload.length) {
+      const d = payload[0].payload;
+      return (
+        <div style={{ background: "var(--panel)", border: "1px solid var(--line)", padding: "10px 14px", borderRadius: "6px", boxShadow: "0 4px 12px rgba(0,0,0,0.06)" }}>
+          <div style={{ fontWeight: 600, color: "var(--ink)", marginBottom: 4 }}>{d.name}</div>
+          <div style={{ color: "var(--accent)", fontWeight: 600 }}>Median markup: {d.v?.toFixed(2)}× CMS ASP payment limit</div>
+          <div style={{ color: "var(--muted)", fontSize: 12, marginTop: 4 }}>
+            <span>Valid observations: <b>{d.rates?.toLocaleString()}</b></span> · <span>Hospitals: <b>{d.hospitals?.toLocaleString()}</b></span>
+          </div>
+        </div>
+      );
+    }
+    return null;
+  };
+
   return (
     <div className="chart">
       <ResponsiveContainer width="100%" height={h}>
-        <BarChart data={data} layout="vertical" margin={{ left: 4, right: 24, top: 22, bottom: 8 }}>
+        <BarChart data={data} layout="vertical" margin={{ left: 4, right: 36, top: 22, bottom: 8 }}>
           <CartesianGrid horizontal={false} stroke="var(--grid)" />
           <XAxis type="number" tickFormatter={(v) => `${+v.toFixed(1)}×`} stroke="var(--muted)"
             fontSize={12} allowDecimals domain={[0, (max) => Math.max(2, Math.ceil(max))]} />
           <YAxis type="category" dataKey="name" width={yw} stroke="var(--muted)" fontSize={12}
             tickFormatter={(s) => (s.length > maxChars ? s.slice(0, maxChars - 1) + "…" : s)} />
-          <Tooltip formatter={(v) => [`${v.toFixed(2)}× ASP+6%`, "Median markup"]}
-            contentStyle={{ background: "var(--panel)", border: "1px solid var(--line)" }} />
+          <Tooltip content={<CustomTooltip />} />
           <ReferenceLine x={1} stroke="var(--ink)" strokeDasharray="4 3"
-            label={{ value: "Medicare", position: "top", fill: "var(--muted)", fontSize: 11 }} />
-          <Bar dataKey="v" radius={[0, 3, 3, 0]}>
+            label={{ value: "Medicare (1.0×)", position: "top", fill: "var(--muted)", fontSize: 11 }} />
+          <Bar dataKey="v" radius={[0, 4, 4, 0]}>
             {data.map((d, i) => (
-              <Cell key={i} fill={d.v >= 3 ? "var(--hot)" : d.v >= 1.5 ? "var(--warm)" : "var(--cool)"} />
+              <Cell key={i} fill={reviewRange.length === 2 &&
+                (d.v < reviewRange[0] || d.v > reviewRange[1]) ? "var(--hot)" : "var(--cool)"} />
             ))}
           </Bar>
         </BarChart>

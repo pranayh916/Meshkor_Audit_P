@@ -1,0 +1,6 @@
+# CMS Provider Data taxonomy used to define the Ohio acute-care market frame.
+state_code: OH
+hospital_types:
+  - Acute Care Hospitals
+  - Acute Care - Veterans Administration
+  - Acute Care - Department of Defense

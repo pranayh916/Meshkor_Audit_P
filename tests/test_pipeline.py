@@ -1,14 +1,37 @@
 """Pipeline tests on made-up TEST data (see conftest.py). Expected values are hand-computed."""
 from datetime import date
+from io import BytesIO
+import json
+from pathlib import Path
+from decimal import Decimal
 
 import polars as pl
 import pytest
 
 from pipeline.common import (Dose, billing_units, hospital_dose, norm_hcpcs, norm_ndc,
                              parse_hcpcs_dosage, payer_group, quarter_from_filename)
+from pipeline.load_asp import classify
+from pipeline.build_compare import comparison_metrics, resolve_benchmark_quarter
+from pipeline.parse_hpt import _json_stream
 
 
 # ---------- unit helpers ----------
+
+
+def test_comparison_financial_math_uses_decimal_and_rejects_invalid_inputs():
+    per_unit, multiple, percent = comparison_metrics("10.00", "2", "4.24")
+    assert per_unit == Decimal("5")
+    assert multiple == Decimal("1.179245283018867924528301887")
+    assert percent == Decimal("17.92452830188679245283018870")
+    with pytest.raises(ValueError, match="greater than zero"):
+        comparison_metrics("10", "1", "0")
+
+
+def test_file_date_quarter_does_not_fall_back_to_latest_asp():
+    assert resolve_benchmark_quarter(date(2027, 1, 15), "file_date",
+                                     ["2026Q3", "2026Q4"]) == "2027Q1"
+    assert resolve_benchmark_quarter(None, "file_date", ["2026Q4"]) is None
+    assert resolve_benchmark_quarter(None, "latest", ["2026Q3", "2026Q4"]) == "2026Q4"
 
 @pytest.mark.parametrize("raw,expected", [
     ("00006-3026-02", "00006302602"),   # 5-4-2
@@ -27,6 +50,20 @@ def test_norm_hcpcs():
     assert norm_hcpcs(" j9271 ") == "J9271"
     assert norm_hcpcs("Note:") is None
     assert norm_hcpcs("123456") is None
+
+
+def test_quarter_parser_accepts_official_month_abbreviations():
+    assert quarter_from_filename("apr_2025_asp_pricing_file_updated_022526.zip") == "2025Q2"
+    assert quarter_from_filename("jul-2024-noc-pricing-file-060624.zip") == "2024Q3"
+
+
+def test_json_stream_ignores_utf8_bom():
+    with _json_stream(lambda: BytesIO(b"\xef\xbb\xbf{\"hospital_name\":\"Test\"}")) as stream:
+        assert json.load(stream) == {"hospital_name": "Test"}
+
+
+def test_noc_payment_files_are_not_treated_as_hcpcs_asp_files():
+    assert classify(Path("April_2024_NOC_Pricing_File_030624___Final_File.zip")) is None
 
 
 def test_dosage_parse():
@@ -89,6 +126,7 @@ def test_tall_dollar_rate(built):
     r = _one(_cmp(built), hcpcs="J9271", payer_name="Anthem Blue Cross",
              price_type="negotiated_dollar", source_member="tall__aaaa1111.csv")
     # 18000 for 100 mg -> 180 per mg; ASP Q4 60 -> 3.0x
+    assert r["file_last_updated"] == date(2026, 10, 1)
     assert r["billing_units"] == 100
     assert r["price_per_billing_unit"] == pytest.approx(180)
     assert r["markup_multiple"] == pytest.approx(3.0)
@@ -124,12 +162,12 @@ def test_unresolved_units_are_not_priced(built):
 def test_ndc_only_row_matched_through_crosswalk(built):
     r = _one(_cmp(built), payer_name="Cigna", price_type="negotiated_dollar")
     assert r["hcpcs"] == "J9271" and r["matched_via"] == "ndc_crosswalk"
-    assert r["markup_multiple"] == pytest.approx(50000 / 200 / 60)
+    assert r["markup_multiple"] == Decimal("4.166666666666666666666666667")
 
 
 def test_out_of_range_flagged(built):
     r = _one(_cmp(built), hcpcs="J2350", price_type="negotiated_dollar")
-    assert r["markup_multiple"] == pytest.approx(0.01)
+    assert r["markup_multiple"] == Decimal("0.010000000000000000000000000")
     assert r["status"] == "review_range"
 
 
@@ -148,6 +186,16 @@ def test_json_in_zip_uses_file_quarter(built):
     assert r["benchmark_quarter"] == "2026Q3"             # file dated 2026-08-01
     assert r["markup_multiple"] == pytest.approx(11000 / 100 / 55)
     assert r["hospital_label"] == "Test JSON Hospital"
+
+
+def test_missing_asp_quarter_is_unpriced(built):
+    r = _one(_cmp(built), source_member="missing_quarter__eeee5555.csv",
+             price_type="negotiated_dollar")
+    assert r["benchmark_quarter"] == "2027Q1"
+    assert r["asp_payment_limit"] is None
+    assert r["price_per_billing_unit"] is None
+    assert r["markup_multiple"] is None
+    assert r["status"] == "missing_asp"
 
 
 def test_gross_and_cash_not_repeated_per_payer(built):

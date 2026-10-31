@@ -5,13 +5,13 @@ import RatesTable from "./RatesTable.jsx";
 
 export default function DrugDetail() {
   const { hcpcs } = useParams();
-  const d = useApi(`drugs/${hcpcs}`, null, [hcpcs]);
+  const d = useApi(`medicare-part-b-drugs/${hcpcs}`, null, [hcpcs]);
   return (
     <Loading state={d}>
       {(drug) => (
         <>
           <section>
-            <div className="crumb"><Link to="/">Drugs</Link> / {drug.hcpcs}</div>
+            <div className="crumb"><Link to="/drug-selection-scope">Drug Selection Scope</Link> / {drug.hcpcs}</div>
             <h1>{drug.hcpcs} · {drug.name} <span className="muted">{drug.brand}</span></h1>
             <p className="lede">HCPCS billing unit: <b>{drug.billing_unit}</b>. Every hospital
               rate is converted to this unit before it is compared.</p>
@@ -29,7 +29,7 @@ export default function DrugDetail() {
               <Table rows={drug.asp} columns={[
                 { key: "quarter", label: "Quarter" },
                 { key: "dosage_text", label: "Dosage" },
-                { key: "payment_limit", label: "ASP+6% payment limit", num: true,
+                { key: "payment_limit", label: "CMS ASP payment limit", num: true,
                   render: (r) => fmt.usd(r.payment_limit) },
               ]} />
             </section>
@@ -59,7 +59,7 @@ export default function DrugDetail() {
                 { key: "payer_groups", label: "Payer groups", num: true },
                 { key: "median_price_per_unit", label: "Median $ / unit", num: true,
                   render: (r) => fmt.usd(r.median_price_per_unit) },
-                { key: "asp_payment_limit", label: "ASP+6%", num: true,
+                { key: "asp_payment_limit", label: "CMS ASP limit", num: true,
                   render: (r) => <>{fmt.usd(r.asp_payment_limit)}
                     <div className="muted">{r.benchmark_quarter}</div></> },
                 { key: "median_markup", label: "Median", num: true,

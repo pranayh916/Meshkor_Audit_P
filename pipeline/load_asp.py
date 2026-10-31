@@ -1,6 +1,6 @@
 """Load CMS ASP payment limit files and NDC-HCPCS crosswalks into Parquet.
 
-Input : every *.zip under data/raw/cms_asp/ and data/raw/cms_crosswalk/
+Input : every *.zip under data/raw_essential_inputs/cms_asp/ and data/raw_essential_inputs/cms_crosswalk/
         whose name has a quarter month + year (january_2026, october_2026, ...).
         Seasonal vaccine files are ignored.
 Output: data/ref/ref_asp.parquet        one row per HCPCS per quarter
@@ -18,14 +18,16 @@ from __future__ import annotations
 import csv
 import io
 import re
+import os
 import sys
 import zipfile
+from datetime import date
 from pathlib import Path
 
 import polars as pl
 
 from .common import (norm_hcpcs, norm_ndc, parse_hcpcs_dosage, paths, quarter_bounds,
-                     quarter_from_filename, rel, sha256, to_float)
+                     quarter_from_filename, rel, sha256, to_float, write_sha256_sidecar)
 
 
 def _key(s: object) -> str:
@@ -100,6 +102,7 @@ def load_payment_limit(zip_path: Path, quarter: str) -> pl.DataFrame:
     i_lim = _pick(header, "paymentlimit")
     start, end = quarter_bounds(quarter)
     digest = sha256(zip_path)
+    write_sha256_sidecar(zip_path, digest)
     out, bad_codes = [], 0
     for r in rows:
         if len(r) <= max(i_code, i_lim):
@@ -149,6 +152,7 @@ def load_crosswalk(zip_path: Path, quarter: str) -> pl.DataFrame:
     i_bup = _pick(header, "billunitspkg")
     start, end = quarter_bounds(quarter)
     digest = sha256(zip_path)
+    write_sha256_sidecar(zip_path, digest)
 
     def cell(r, i):
         return r[i].strip() if i is not None and i < len(r) else ""
@@ -191,9 +195,25 @@ def classify(zip_path: Path) -> str | None:
         return None
     if "crosswalk" in n:
         return "crosswalk"
+    # NOC tables are not keyed by HCPCS and cannot support the code-level ASP
+    # comparison. Do not let them replace the quarterly ASP pricing file.
+    if re.search(r"(?:^|[_-])noc(?:[_-]|$)", n):
+        return None
     if "payment_limit" in n or "payment-limit" in n or "asp_pricing" in n or "pricing_file" in n:
         return "asp"
     return None
+
+
+def _revision_key(path: Path) -> tuple:
+    """Prefer explicit CMS revised files and the latest valid MMDDYY suffix."""
+    dates = []
+    for token in re.findall(r"(?<!\d)(\d{6})(?!\d)", path.stem):
+        try:
+            dates.append(date(2000 + int(token[4:]), int(token[:2]), int(token[2:4])))
+        except ValueError:
+            continue
+    return ("updated" in path.stem.casefold(), max(dates, default=date.min),
+            path.stat().st_mtime_ns, path.name.casefold())
 
 
 def main() -> int:
@@ -206,11 +226,21 @@ def main() -> int:
         if kind is None or q is None:
             print(f"  skip (not an ASP/crosswalk quarter file): {z.name}")
             continue
-        if (kind, q) in chosen:
-            print(f"  NOTE two {kind} files for {q}; using {z.name} over {chosen[(kind, q)].name}")
-        chosen[(kind, q)] = z
+        prior = chosen.get((kind, q))
+        if prior is None:
+            chosen[(kind, q)] = z
+        elif _revision_key(z) > _revision_key(prior):
+            print(f"  NOTE two {kind} files for {q}; using {z.name} over {prior.name}")
+            chosen[(kind, q)] = z
+        else:
+            print(f"  NOTE two {kind} files for {q}; keeping {prior.name} over {z.name}")
 
     if not chosen:
+        asp_snapshot = p["ref"] / "ref_asp.parquet"
+        crosswalk_snapshot = p["ref"] / "ref_crosswalk.parquet"
+        if asp_snapshot.is_file():
+            print("No new ASP/crosswalk source files; using the saved Parquet snapshots.")
+            return 0
         print("No ASP or crosswalk ZIPs found under", raw)
         return 1
 
@@ -218,10 +248,48 @@ def main() -> int:
     xw = [load_crosswalk(z, q) for (k, q), z in sorted(chosen.items()) if k == "crosswalk"]
 
     p["ref"].mkdir(parents=True, exist_ok=True)
-    if asp:
-        pl.concat(asp).write_parquet(p["ref"] / "ref_asp.parquet", compression="zstd")
-    if xw:
-        pl.concat(xw).write_parquet(p["ref"] / "ref_crosswalk.parquet", compression="zstd")
+    outputs = []
+    for frames, filename in ((asp, "ref_asp.parquet"), (xw, "ref_crosswalk.parquet")):
+        if not frames:
+            continue
+        target = p["ref"] / filename
+        tmp = target.with_name(target.name + ".part")
+        incoming = pl.concat(frames, how="vertical_relaxed")
+        if target.is_file():
+            existing = pl.read_parquet(target)
+            incoming_quarters = incoming["quarter"].unique().to_list()
+            existing = existing.filter(~pl.col("quarter").is_in(incoming_quarters))
+            incoming = pl.concat([existing, incoming], how="vertical_relaxed").sort("quarter")
+        incoming.write_parquet(tmp, compression="zstd")
+        count = pl.scan_parquet(tmp).select(pl.len()).collect().item()
+        if count <= 0:
+            tmp.unlink(missing_ok=True)
+            raise ValueError(f"Refusing to replace {filename} with an empty dataset")
+        outputs.append((tmp, target))
+    backups = {}
+    existing = {target: target.exists() for _, target in outputs}
+    try:
+        for _, target in outputs:
+            if target.exists():
+                backup = target.with_name(target.name + ".bak")
+                import shutil
+                shutil.copy2(target, backup)
+                backups[target] = backup
+        try:
+            for tmp, target in outputs:
+                os.replace(tmp, target)
+        except Exception:
+            for _, target in outputs:
+                if target in backups:
+                    os.replace(backups[target], target)
+                elif not existing[target]:
+                    target.unlink(missing_ok=True)
+            raise
+    finally:
+        for tmp, _ in outputs:
+            tmp.unlink(missing_ok=True)
+        for backup in backups.values():
+            backup.unlink(missing_ok=True)
     print(f"Wrote {len(asp)} ASP quarters and {len(xw)} crosswalk quarters to {rel(p['ref'])}")
     return 0
 

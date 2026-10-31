@@ -2,7 +2,7 @@ import { fmt, useApi } from "../api.js";
 import { Loading, Table } from "../components.jsx";
 
 export default function Quality() {
-  const q = useApi("quality");
+  const q = useApi("hospital-file-quality");
   return (
     <section>
       <h1>Data quality by file</h1>
