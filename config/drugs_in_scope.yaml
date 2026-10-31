@@ -1,43 +1,4 @@
-# Drugs in scope for the Ohio market report.
-#
-# STATUS: PROVISIONAL starter list (5 drugs). Replace with the top 20 J-codes by
-# Medicare Part B spend once the CMS Part B Spending by Drug file is downloaded.
-#
-# billing_unit is the HCPCS descriptor dose. The ASP loader reads the official
-# "HCPCS Code Dosage" from each quarterly ASP file and the pipeline checks that
-# it matches the value below. A mismatch stops the comparison for that drug.
-#
-# reviewed_by: name of the pharmacist / clinical reviewer who checked the
-# unit conversion. Results for a drug with no reviewer are shown as
-# "not yet reviewed" in the UI and report.
-
-drugs:
-  - hcpcs: J9271
-    name: Pembrolizumab
-    brand: Keytruda
-    billing_unit: {qty: 1, unit: MG}
-    reviewed_by: null
-
-  - hcpcs: J9299
-    name: Nivolumab
-    brand: Opdivo
-    billing_unit: {qty: 1, unit: MG}
-    reviewed_by: null
-
-  - hcpcs: J2350
-    name: Ocrelizumab
-    brand: Ocrevus
-    billing_unit: {qty: 1, unit: MG}
-    reviewed_by: null
-
-  - hcpcs: J1745
-    name: Infliximab (not biosimilar)
-    brand: Remicade
-    billing_unit: {qty: 10, unit: MG}
-    reviewed_by: null
-
-  - hcpcs: J0897
-    name: Denosumab
-    brand: Prolia / Xgeva
-    billing_unit: {qty: 1, unit: MG}
-    reviewed_by: null
+# Drug identities and billing units are derived from CMS source files.
+# pipeline.select_drugs writes the current data to data/ref/drug_scope.parquet.
+# Manual reviewer sign-offs are read from data/raw_essential_inputs/unit_reviews/.
+drugs: []

@@ -5,12 +5,12 @@ Run from the infusion-audit folder:
     python download_mrfs.py
 
 What it does:
-1. In each data/raw/hospital_mrf/<system>/ folder, finds the .txt index file.
+1. In each data/raw_essential_inputs/hospital_mrf/<system>/ folder, finds the .txt index file.
 2. Moves it to <system>/<DATE>/cms-hpt.txt.
 3. Reads every location-name + mrf-url pair.
 4. Skips out-of-state locations (list below).
 5. Downloads each unique mrf-url once into <system>/<DATE>/.
-6. Writes data/raw/hospital_mrf/mrf_download_log.csv.
+6. Writes data/raw_essential_inputs/hospital_mrf/mrf_download_log.csv.
 
 Safe to re-run: files already downloaded are skipped.
 """
@@ -26,8 +26,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
+import sys
 
-ROOT = Path("data/raw/hospital_mrf")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pipeline.common import paths
+
+ROOT = paths()["raw"] / "hospital_mrf"
 DATE = date.today().isoformat()
 LOG = ROOT / "mrf_download_log.csv"
 
@@ -96,6 +100,13 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def write_sha256_sidecar(path: Path, digest: str) -> None:
+    sidecar = path.with_name(path.name + ".sha256")
+    temporary = sidecar.with_name(sidecar.name + ".part")
+    temporary.write_text(f"{digest}  {path.name}\n", encoding="ascii")
+    temporary.replace(sidecar)
+
+
 def prepare_index(system_dir: Path) -> Path | None:
     # Use the newest date folder that already holds cms-hpt.txt.
     existing = sorted(system_dir.glob("*/cms-hpt.txt"))
@@ -155,8 +166,10 @@ def main() -> None:
                     if not p.name.endswith(".part") and p.stat().st_size > 0]
             if done:
                 out = done[0]
+                digest = sha256(out)
+                write_sha256_sidecar(out, digest)
                 row.update(status="already downloaded", file_name=out.name,
-                           size_bytes=out.stat().st_size, sha256=sha256(out))
+                           size_bytes=out.stat().st_size, sha256=digest)
                 print(f"[{system_dir.name}] already downloaded: {out.name}")
                 log_rows.append(row)
                 continue
@@ -204,7 +217,9 @@ def main() -> None:
                     status = "ok"
                     if b"<html" in head or b"<!doctype html" in head:
                         status = "ERROR got HTML page, not data"
-                    row.update(status=status, file_name=name, size_bytes=size, sha256=sha256(out))
+                    digest = sha256(out)
+                    write_sha256_sidecar(out, digest)
+                    row.update(status=status, file_name=name, size_bytes=size, sha256=digest)
                     print(f"[{system_dir.name}] {status}: {name} ({size:,} bytes)")
                     last_err = None
                     break

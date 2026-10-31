@@ -11,16 +11,16 @@ export default function Method() {
         rules. We keep the rows for the drugs in scope, identified by HCPCS code or by an NDC that
         the CMS NDC-HCPCS crosswalk maps to that code.</p>
       <p>The benchmark is the CMS Medicare Part B payment limit for the same HCPCS code. That
-        limit is already 106% of the Average Sales Price (ASP + 6%), so no further 6% is added.
-        The quarter used is the one that contains the hospital file's "last updated" date. If
-        that quarter is not loaded, the latest quarter is used.</p>
+        limit already includes the ASP + 6% adjustment, so no further 6% is added.
+        The comparison uses the ASP quarter containing the hospital file's "last updated" date.
+        If that quarter is unavailable, the row is marked as missing its ASP benchmark and is
+        left unpriced.</p>
 
       <h2>The calculation</h2>
       <ol>
-        <li>Read the quantity the hospital priced (for example 100 mg) from the file's drug
-          unit fields.</li>
-        <li>Divide by the HCPCS billing unit (for example 10 mg for infliximab) to get billing
-          units. 100 mg ÷ 10 mg = 10 units.</li>
+        <li>Read the quantity and measurement unit the hospital priced from its source file.</li>
+        <li>Convert that quantity to HCPCS billing units using the verified dosage for the
+          selected code. If the units cannot be verified or converted, leave the row unpriced.</li>
         <li>Price per billing unit = hospital rate ÷ billing units.</li>
         <li>Markup = price per billing unit ÷ ASP payment limit. 1.00× equals Medicare.</li>
       </ol>
@@ -30,8 +30,8 @@ export default function Method() {
       <ul className="plain">
         {Object.keys(STATUS_TEXT).map((s) => <li key={s}><StatusPill status={s} /></li>)}
       </ul>
-      <p>A row whose unit cannot be converted is shown but never priced. Markups below 0.5× or
-        above 20× are held for a manual check, because they are usually unit errors.</p>
+      <p>A row whose unit cannot be converted is shown but never priced. Markups outside the
+        configured review range are held for a manual check because they may indicate a unit error.</p>
 
       <h2>Limits</h2>
       <ul>
@@ -50,13 +50,11 @@ export default function Method() {
 
       <h2>Sources</h2>
       <ul>
-        <li>CMS ASP Pricing Files and NDC-HCPCS crosswalk:
-          cms.gov/medicare/payment/part-b-drugs/asp-pricing-files</li>
-        <li>Hospital price files: each hospital's cms-hpt.txt index.</li>
-        <li>CMS hospital price transparency template: github.com/CMSgov/hospital-price-transparency</li>
+        <li>CMS ASP Pricing Files and NDC-HCPCS Crosswalk</li>
+        <li>Official Hospital Standard Charges Price Transparency Portals</li>
+        <li>CMS Hospital Price Transparency Guidelines</li>
       </ul>
-      <p>Every row keeps its source file name and SHA-256 hash, so any number can be traced to
-        the exact file it came from.</p>
+      <p>Every row keeps its source file reference, so any figure can be traced to the exact source file it came from.</p>
     </section>
   );
 }
