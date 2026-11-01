@@ -1,39 +1,40 @@
-# Demonstration guide
+# Local run guide
 
-## Start
+The app uses a React/Vite frontend, Django's native ASGI app, SQLite for
+authentication/operational records, and Parquet for analytical data.
 
-1. Ensure the installed PostgreSQL service is running and the existing
-   PostgreSQL configuration in `.env` is valid.
-2. From the project root, run `python -m pipeline.run_all` when the source data
-   has changed. The pipeline reuses unchanged fingerprinted Parquet inputs.
-3. Run `python build_market_report.py` to refresh the draft report artifacts.
-4. Ensure the single protected Root Admin has been selected with
-   `python backend\manage.py configure_root_admin --username <root-admin-username>`.
-   Existing account passwords and operational records are preserved.
-5. In one terminal, run `python backend\manage.py runserver 127.0.0.1:8000`.
-6. In another, run `cd frontend` then `npm run dev` and open the printed Vite
-   URL (normally `http://127.0.0.1:5173`).
+## Start the backend
 
-## Review flow
+From the project root:
 
-1. Sign in with the existing Admin account. Do not use a shared or default
-   password. If Admin OTP is enabled, enter a current authenticator code.
-2. Inspect the Overview, Data Sources, Hospital Files, and Drug Scope pages.
-   The current Parquet snapshot contains 128 hospital keys across 20 HCPCS
-   codes.
-3. Open a J1561 hospital row and inspect its source member, hospital quantity,
-   HCPCS dosage, ASP quarter, payment limit, unit price, and status.
-4. Demonstrate an unresolved row and a `missing_asp` row as unpriced. Do not
-   replace their values with another quarter or infer package concentration.
-5. Show that the report is marked DRAFT. The current 20 drug units have no
-   manual review sign-off and 33 HPT CCNs do not match the Ohio catalog.
-6. Sign out and use a Viewer account. Confirm report/analytics pages are
-   available and source import, processing jobs, unit review, OTP settings,
-   and audit-log operations are blocked.
+```powershell
+Set-Location backend
+..\.venv\Scripts\python.exe -m uvicorn auditapi.asgi:application --host 127.0.0.1 --port 8000
+```
 
-## Expected limitation to state
+Check `http://127.0.0.1:8000/api/v1/system/health-check/`. The health response
+should report `api`, `database`, and `parquet` as `ok`.
 
-This is an Ohio market report draft, not a clinical recommendation or
-utilization-weighted employer savings calculation. Only 7,783 negotiated
-dollar rows are currently `ok`; most records have unresolved units. Do not
-approve or publish until billing units and hospital coverage are reviewed.
+## Start the frontend
+
+In a second terminal:
+
+```powershell
+Set-Location frontend
+npm run dev -- --host 127.0.0.1 --port 5173
+```
+
+Open `http://127.0.0.1:5173/`. Sign in with a locally provisioned account.
+There are no hardcoded demo credentials. Admins enroll Google Authenticator on
+first sign-in; Viewers use password sign-in and can see only a released report.
+
+## Import real source data
+
+Sign in as Admin, upload a source listed in `config/report.json`, and use the
+data-source processing action. The worker converts inputs to Parquet and builds
+the comparison and report outputs. Raw files are needed to import or refresh;
+normal dashboard/report reads use the stored Parquet snapshot.
+
+Do not release the report until all selected drug billing units have external
+clinical review, a second Admin releases the report, and the coverage/source
+gaps have been reviewed.

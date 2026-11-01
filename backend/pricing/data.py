@@ -1,4 +1,4 @@
-"""DuckDB access to curated Parquet outputs; PostgreSQL stores app operations."""
+"""DuckDB access to curated Parquet outputs; SQLite stores app operations."""
 from __future__ import annotations
 
 import json
@@ -82,6 +82,22 @@ def comparison_sha256() -> str:
         _SHA_CACHE.clear()
         _SHA_CACHE[key] = sha256(f)
     return _SHA_CACHE[key]
+
+
+def config_sha256() -> str:
+    """Fingerprint every versioned project configuration input."""
+    import hashlib
+
+    config_dir = Path(__file__).resolve().parents[2] / "config"
+    digest = hashlib.sha256()
+    for file_path in sorted(p for p in config_dir.rglob("*") if p.is_file()):
+        relative = file_path.relative_to(config_dir).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        with file_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def drug_config() -> dict[str, dict]:

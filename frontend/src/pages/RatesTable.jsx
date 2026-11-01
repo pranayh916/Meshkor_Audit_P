@@ -8,9 +8,10 @@ const PAYERS = ["", "Anthem", "UnitedHealthcare", "Aetna", "Cigna", "Medical Mut
   "CareSource", "Molina", "Medicare Advantage", "Medicaid MCO", "Other", "Not stated", "All payers"];
 
 /** Server-side filtered, sorted, paged rate table with CSV export. */
-export default function RatesTable({ fixed = {} }) {
+export default function RatesTable({ fixed = {}, user }) {
+  const isAdmin = user?.roles?.includes("Admin");
   const [searchParams] = useSearchParams();
-  const [f, setF] = useState({ price_type: "negotiated_dollar", status: "", payer_group: "", q: "" });
+  const [f, setF] = useState({ price_type: "", status: "", payer_group: "", q: "" });
   const [sort, setSort] = useState({ sort: "markup_multiple", order: "desc" });
   const [offset, setOffset] = useState(0);
   const [res, setRes] = useState({ rows: [], total: 0, error: null, loading: true });
@@ -45,10 +46,10 @@ export default function RatesTable({ fixed = {} }) {
           <option value="">All price types</option>
           {Object.entries(PRICE_TYPE_TEXT).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
         </select>
-        <select value={f.status} onChange={set("status")}>
+        {isAdmin && <select value={f.status} onChange={set("status")}>
           <option value="">All statuses</option>
           {Object.entries(STATUS_TEXT).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-        </select>
+        </select>}
         <select value={f.payer_group} onChange={set("payer_group")}>
           {PAYERS.map((p) => <option key={p} value={p}>{p || "All payer groups"}</option>)}
         </select>
@@ -66,6 +67,10 @@ export default function RatesTable({ fixed = {} }) {
               {th("payer_group", "Payer / plan")}
               <th>Hospital priced</th>
               {th("price", "Price", true)}
+              <th className="num">Gross charge</th>
+              <th className="num">Discounted cash</th>
+              <th className="num">Negotiated %</th>
+              <th className="num">Median / P10–P90</th>
               <th className="num">Billing units</th>
               {th("price_per_billing_unit", "$ / unit", true)}
               <th className="num">CMS ASP payment limit</th>
@@ -75,7 +80,7 @@ export default function RatesTable({ fixed = {} }) {
           </thead>
           <tbody>
             {res.rows.map((r, i) => (
-              <tr key={i} title={`${r.source_file || ""} :: ${r.source_member || ""}`.trim()}>
+              <tr key={i} title={isAdmin ? `${r.source_file || ""} :: ${r.source_member || ""}`.trim() : undefined}>
                 <td><Link to={`/hospitals/${r.hospital_key}`}>{r.hospital_label}</Link>
                   <div className="muted">{r.setting || ""}</div></td>
                 {!fixed.hcpcs && <td><Link to={`/drugs/${r.hcpcs}`}>{r.hcpcs}</Link>
@@ -89,6 +94,11 @@ export default function RatesTable({ fixed = {} }) {
                   ? (r.negotiated_percentage != null ? `${r.negotiated_percentage}% of charges`
                     : "formula") : fmt.usd(r.price)}
                   <div className="muted">{PRICE_TYPE_TEXT[r.price_type]}</div></td>
+                <td className="num">{fmt.usd(r.gross_charge)}</td>
+                <td className="num">{fmt.usd(r.discounted_cash)}</td>
+                <td className="num">{r.negotiated_percentage == null ? "—" : `${r.negotiated_percentage}%`}</td>
+                <td className="num">{[r.median_amount, r.p10_amount, r.p90_amount].some((v) => v != null)
+                  ? `${fmt.usd(r.median_amount)} / ${fmt.usd(r.p10_amount)}–${fmt.usd(r.p90_amount)}` : "—"}</td>
                 <td className="num">{r.billing_units == null ? "—" : +r.billing_units.toFixed(3)}</td>
                 <td className="num">{fmt.usd(r.price_per_billing_unit)}</td>
                 <td className="num">{fmt.usd(r.asp_payment_limit)}

@@ -1,0 +1,30 @@
+# Unit canonicalization and conversion policy for L3 only.
+# The pipeline preserves original values in normalized L2 Parquet.
+aliases:
+  ME: MG
+  GR: G
+  GM: G
+  UG: MCG
+  UN: UNIT
+  UNITS: UNIT
+  F2: UNIT
+  IU: UNIT
+  INTERNATIONAL UNITS: UNIT
+  MILLILITER: ML
+  MILLILITERS: ML
+  EACH: EA
+mass_to_mg:
+  MG: 1
+  G: 1000
+  MCG: 0.001
+same_unit_only:
+  - UNIT
+nonconvertible_without_ndc_reference:
+  - ML
+  - EA
+  - VIAL
+  - PACKAGE
+  - DOSE
+  - VISIT
+concentration_requires_ndc_reference: true
+unresolved_policy: "Never estimate a price when the unit conversion cannot be verified."

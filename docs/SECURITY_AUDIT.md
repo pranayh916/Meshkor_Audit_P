@@ -1,44 +1,47 @@
-# Security audit
+# Security controls and limits
 
-**Audit date:** 2026-10-31
+**Audit date:** 2026-11-01
 
-## Findings fixed
+## Implemented controls
 
-- **Authorization bypass:** Django `is_staff` alone previously granted all
-  application capabilities. It no longer grants API access. Only explicit
-  Admin/Viewer membership works; Django superusers are Admin.
-- **Role over-provisioning:** the app exposed a third Data Analyst role. A
-  non-destructive data migration now leaves exactly Admin and Viewer groups.
-  Existing Data Analyst users move to Viewer, the least-privileged mapping.
-- **Root account protection:** Django superuser accounts cannot be deleted or
-  have their username, active/staff/superuser flags, groups, or permissions
-  changed through the user admin. Bulk user deletion is disabled.
+- Application API permissions are based on explicit Admin/Viewer roles;
+  `is_staff` alone does not grant application access.
+- Admin sign-in requires Google Authenticator TOTP. Viewer sign-in does not
+  require OTP. Seeds are encrypted with a configured Fernet key, OTP replay is
+  checked, recovery codes are stored as hashes and consumed once, and login
+  challenges are rate limited.
+- Browser sign-in is CSRF protected. Passwords use Django password hashers,
+  failed passwords are throttled, and bearer access tokens expire.
+- Viewer analytics responses require a current released report and filter out
+  unresolved, ambiguous, mismatched, and unreviewed rows. Admin-only source,
+  quality, unit-review, user, job, configuration, and audit endpoints are
+  protected server-side.
+- Uploads are constrained by configured source keys, extensions, signatures,
+  byte limits, and archive checks before storage.
+- Analytical queries use allow-listed tables/columns and bound parameters.
+  Reference browsing does not allow arbitrary SQL.
+- SQLite stores operational/authentication records. Analytics are read from
+  Parquet using DuckDB.
+- CSV exports prefix spreadsheet formula-like text cells so imported hospital
+  labels or reviewer notes cannot execute as formulas when opened in Excel.
+- Login, MFA challenge/setup, recovery-code, and token-refresh responses are
+  marked non-cacheable.
+- npm and Python package advisory scans report zero known vulnerabilities after
+  upgrading the affected locked dependencies.
 
-## Controls verified in code
+## Important operating requirements
 
-- Password login requires CSRF for browser sessions, has per-user/IP failure
-  throttling, and issues short-lived JWTs. Refresh requires the HttpOnly Django
-  session, not a bearer token.
-- Admin OTP uses Fernet-encrypted TOTP seeds, one-time hashed recovery codes,
-  replay-step tracking, and rate-limited challenges.
-- File upload validates source keys, extensions, signatures, maximum bytes,
-  ZIP paths, member count, encrypted members, expansion size, and compression
-  ratio. File names are normalized and saved below configured roots.
-- Analytical query tables and sortable columns are allow-listed. Values use
-  bound query parameters. Reference browsing does not expose arbitrary SQL.
-- Production settings require a secret key and database password; `.env` is
-  ignored and is not a tracked Git file. Credentials were not printed.
-- Production CORS defaults to no allowed origins unless explicitly configured.
+- Set stable, private `DJANGO_SECRET_KEY` and `TOTP_ENCRYPTION_KEY` values in
+  the ignored `.env` file before Admin enrollment. Losing the TOTP encryption
+  key prevents enrolled seeds from being decrypted.
+- The local HTTP setup is intended for development on loopback. Keep the local
+  `.env` file private and outside Git.
+- Report release is a separate approval: the builder cannot approve their own
+  report, two active Admin accounts are required, and every selected drug needs
+  external clinical unit review.
 
-## Checks and open work
+## Verification limits
 
-- Django `check`: passed.
-- Django `check --deploy`: five warnings in the current development config:
-  `DEBUG=True`, HTTP allowed for local use, HSTS unset, and session/CSRF secure
-  cookies disabled for HTTP development. Production requires TLS, `DEBUG=0`,
-  secure cookies, correct host/origin configuration, and HSTS after verifying
-  the deployment is HTTPS-only.
-- Static review and application tests were run. No third-party dependency
-  vulnerability database scan (`pip-audit`, OSV, or `npm audit`) was completed.
-- A full browser-driven security/E2E review was not completed. Recheck role
-  assignments and OTP enrollment in the actual demonstration browser.
+The backend tests, Django checks, and dependency advisory scans pass. This is a
+code-level review, not a penetration test. A full browser-driven workflow has
+not been completed.

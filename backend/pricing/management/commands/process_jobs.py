@@ -6,6 +6,7 @@ Use --once to process at most one queued job and exit.
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import sys
 import time
@@ -15,6 +16,7 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.utils import timezone
 
+from pricing import data as analytics_data
 from pricing.models import AuditEvent, ProcessingJob, ReportRecord, SourceFile
 
 
@@ -133,20 +135,31 @@ class Command(BaseCommand):
                 raise ValueError(f"Unsupported queued job type: {job.job_type}")
 
             dashboard = project / "reports" / "dashboard_data.json"
-            config = project / "config" / "report.json"
-            if dashboard.is_file() and config.is_file():
-                source_hash = hashlib.sha256(dashboard.read_bytes()).hexdigest()
-                config_hash = hashlib.sha256(config.read_bytes()).hexdigest()
-                record, _ = ReportRecord.objects.update_or_create(
-                    source_hash=source_hash,
-                    defaults={"name": f"Ohio market report {timezone.localdate().isoformat()}",
-                              "report_type": "ohio_market",
-                              "status": "draft" if not success else "generated",
-                              "output_path": "reports/ohio_market_report_draft.md",
-                              "config_hash": config_hash,
-                              "metadata": {"job_id": job.pk, "job_type": job.job_type,
-                                           "pipeline_success": success}},
-                )
+            if dashboard.is_file():
+                dashboard_bytes = dashboard.read_bytes()
+                dashboard_payload = json.loads(dashboard_bytes)
+                source_hash = analytics_data.comparison_sha256()
+                config_hash = analytics_data.config_sha256()
+                record = (ReportRecord.objects.filter(source_hash=source_hash, config_hash=config_hash)
+                          .order_by("-generated_at").first())
+                defaults = {
+                    "name": f"Ohio market report {timezone.localdate().isoformat()}",
+                    "report_type": "ohio_market",
+                    "status": "generated" if success and not dashboard_payload.get("draft", True) else "draft",
+                    "output_path": "reports/ohio_market_report_draft.md",
+                    "built_by": job.requested_by,
+                    "metadata": {"job_id": job.pk, "job_type": job.job_type,
+                                 "pipeline_success": success,
+                                 "dashboard_sha256": hashlib.sha256(dashboard_bytes).hexdigest(),
+                                 "draft_reasons": dashboard_payload.get("draft_reasons", {})},
+                }
+                if record is None:
+                    record = ReportRecord.objects.create(source_hash=source_hash,
+                                                         config_hash=config_hash, **defaults)
+                elif record.status != "released":
+                    for field, value in defaults.items():
+                        setattr(record, field, value)
+                    record.save(update_fields=[*defaults.keys()])
                 job.summary = {"report_id": record.pk}
             if success:
                 converted_count = _mark_parquet_converted(project)

@@ -162,6 +162,7 @@ def load_nppes() -> bool:
     required = {"NPI", "Entity Type Code", "Provider Organization Name (Legal Business Name)",
                 "Provider Last Name (Legal Name)", "Provider First Name", 
                 "Provider Business Practice Location Address State Name",
+                "Provider Business Practice Location Address Postal Code",
                 "Provider Business Practice Location Address City Name",
                 "Provider Business Mailing Address State Name", "Provider Enumeration Date",
                 "NPI Deactivation Reason Code", "NPI Deactivation Date", "NPI Reactivation Date"}
@@ -173,20 +174,34 @@ def load_nppes() -> bool:
                 if re.fullmatch(r"Healthcare Provider Primary Taxonomy Switch_\d+", c)}
     if not taxonomy:
         raise ValueError("NPPES file has no taxonomy-code fields")
+    if not switches:
+        raise ValueError("NPPES file has no primary-taxonomy switch fields")
     primary = pl.coalesce([
         pl.when(pl.col(switches[c.rsplit("_", 1)[1]]) == "Y").then(pl.col(c))
         for c in taxonomy if c.rsplit("_", 1)[1] in switches
-    ] + [pl.col(taxonomy[0])])
+    ])
     organization = pl.col("Provider Organization Name (Legal Business Name)").str.strip_chars()
     individual = pl.concat_str([
         pl.col("Provider First Name"), pl.col("Provider Middle Name"),
         pl.col("Provider Last Name (Legal Name)"),
     ], separator=" ", ignore_nulls=True).str.strip_chars()
     practice_state = pl.col("Provider Business Practice Location Address State Name").str.strip_chars().str.to_uppercase()
-    mailing_state = pl.col("Provider Business Mailing Address State Name").str.strip_chars().str.to_uppercase()
+    practice_zip3 = pl.col("Provider Business Practice Location Address Postal Code").str.strip_chars().str.extract(r"^(\d{3})", 1)
+    geography = load_yaml("geography.yaml")
+    hospital_taxonomies = load_yaml("hospital_taxonomies.yaml")
+    state_code = str(geography.get("state_code", "OH")).upper()
+    border_zip3 = [str(value).zfill(3) for value in geography.get("include_border_zip3", [])]
+    accepted_taxonomies = [str(value).upper() for value in hospital_taxonomies.get("primary_taxonomy_codes", [])]
+    market_filter = (practice_state == state_code)
+    if border_zip3:
+        market_filter = market_filter | practice_zip3.is_in(border_zip3)
     source_hash = sha256(source)
     write_sha256_sidecar(source, source_hash)
-    frame = lazy.filter((practice_state == "OH") | ((practice_state == "") & (mailing_state == "OH"))).select(
+    frame = lazy.filter(
+        (pl.col("Entity Type Code").str.strip_chars() == str(hospital_taxonomies.get("provider_entity_type", "2")))
+        & market_filter
+        & primary.is_in(accepted_taxonomies)
+    ).select(
         pl.col("NPI").str.strip_chars().alias("npi"),
         pl.col("Entity Type Code").alias("entity_type"),
         pl.when(pl.col("Entity Type Code") == "2").then(organization).otherwise(individual).alias("provider_name"),
@@ -202,7 +217,7 @@ def load_nppes() -> bool:
         pl.lit(rel(source)).alias("source_file"), pl.lit(source_hash).alias("source_sha256"),
     )
     count = _write_atomic(frame, paths()["ref"] / "ref_providers.parquet")
-    print(f"NPPES: {count:,} Ohio providers with taxonomy and status; source SHA-256 {source_hash}")
+    print(f"NPPES: {count:,} {state_code} Type 2 providers in configured hospital taxonomies; source SHA-256 {source_hash}")
     return True
 
 
@@ -230,6 +245,7 @@ def load_hospital_enrollments() -> bool:
         & (pl.col("SUBGROUP - ACUTE CARE").str.strip_chars().str.to_uppercase() == "Y")
         & pl.col("CCN").is_not_null() & (pl.col("CCN").str.strip_chars() != "")
         & pl.col("NPI").is_not_null() & (pl.col("NPI").str.strip_chars() != "")
+        & (pl.col("CCN").str.strip_chars() != pl.col("NPI").str.strip_chars())
     ).select(
         pl.col("CCN").str.strip_chars().alias("ccn"), pl.col("NPI").str.strip_chars().alias("npi"),
         pl.col("ENROLLMENT ID").alias("enrollment_id"), pl.col("ORGANIZATION NAME").alias("organization_name"),

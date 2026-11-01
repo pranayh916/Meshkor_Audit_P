@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from functools import lru_cache
 import os
 import re
 from dataclasses import dataclass
@@ -13,10 +14,18 @@ import yaml
 PROJECT = Path(__file__).resolve().parent.parent
 
 HCPCS_RE = re.compile(r"^[A-Z0-9]\d{3}[A-Z0-9]$")
+CSV_FORMULA_PREFIX_RE = re.compile(r"^[\s\x00-\x1f\x7f\ufeff]*[=+@-]")
 MONTH_TO_Q = {
     "jan": 1, "january": 1, "apr": 2, "april": 2,
     "jul": 3, "july": 3, "oct": 4, "october": 4,
 }
+
+
+def csv_safe_cell(value):
+    """Neutralize spreadsheet formula prefixes in untrusted CSV text cells."""
+    if isinstance(value, str) and CSV_FORMULA_PREFIX_RE.match(value):
+        return "'" + value
+    return value
 
 
 def load_yaml(name: str) -> dict:
@@ -140,10 +149,16 @@ def norm_ndc(raw: object) -> str | None:
 
 # ---------- units ----------
 
-# CMS hospital template drug_type_of_measurement values, mapped to a base unit.
-#   GR = gram, ME = milligram, ML = millilitre, UN = unit, F2 = international unit, EA = each
-_MASS_TO_MG = {"ME": 1.0, "MG": 1.0, "GR": 1000.0, "GM": 1000.0, "G": 1000.0, "MCG": 0.001, "UG": 0.001}
-_UNIT_WORDS = {"UN", "UNIT", "UNITS", "F2", "IU", "INTERNATIONAL UNITS"}
+@lru_cache(maxsize=1)
+def unit_rules() -> dict:
+    """Read canonical unit aliases and conversion factors from versioned config."""
+    return load_yaml("units.yaml")
+
+
+def canonical_unit(value: object) -> str:
+    unit = str(value or "").strip().upper()
+    aliases = unit_rules().get("aliases", {})
+    return str(aliases.get(unit, unit)).upper()
 
 
 @dataclass(frozen=True)
@@ -161,11 +176,10 @@ def parse_hcpcs_dosage(text: object) -> Dose | None:
     if not m:
         return None
     qty = float(m.group(1).replace(",", ""))
-    unit = m.group(2).strip()
-    if unit in _MASS_TO_MG:
-        return Dose(qty * _MASS_TO_MG[unit], "MG")
-    if unit in _UNIT_WORDS:
-        return Dose(qty, "UNIT")
+    unit = canonical_unit(m.group(2).strip())
+    mass_to_mg = unit_rules().get("mass_to_mg", {})
+    if unit in mass_to_mg:
+        return Dose(qty * float(mass_to_mg[unit]), "MG")
     return Dose(qty, unit)
 
 
@@ -179,16 +193,11 @@ def hospital_dose(qty: object, type_code: object) -> Dose | None:
         return None
     if q <= 0:
         return None
-    t = str(type_code).strip().upper()
-    if t in _MASS_TO_MG:
-        return Dose(q * _MASS_TO_MG[t], "MG")
-    if t in _UNIT_WORDS:
-        return Dose(q, "UNIT")
-    if t == "ML":
-        return Dose(q, "ML")
-    if t == "EA":
-        return Dose(q, "EA")
-    return Dose(q, t)
+    unit = canonical_unit(type_code)
+    mass_to_mg = unit_rules().get("mass_to_mg", {})
+    if unit in mass_to_mg:
+        return Dose(q * float(mass_to_mg[unit]), "MG")
+    return Dose(q, unit)
 
 
 def billing_units(hosp: Dose | None, billing: Dose) -> tuple[float | None, str]:
@@ -200,8 +209,8 @@ def billing_units(hosp: Dose | None, billing: Dose) -> tuple[float | None, str]:
         return None, "no drug unit on hospital row"
     if hosp.unit == billing.unit and billing.qty > 0:
         return hosp.qty / billing.qty, f"{hosp.qty:g} {hosp.unit} / {billing.qty:g} {billing.unit}"
-    if hosp.unit in {"ML", "EA"}:
-        return None, f"hospital priced per {hosp.unit}; needs product concentration"
+    if hosp.unit in set(unit_rules().get("nonconvertible_without_ndc_reference", [])):
+        return None, f"hospital priced per {hosp.unit}; needs a verified NDC crosswalk/reference"
     return None, f"unit mismatch: hospital {hosp.unit} vs billing {billing.unit}"
 
 

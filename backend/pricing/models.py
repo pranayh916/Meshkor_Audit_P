@@ -47,6 +47,8 @@ class ReportRecord(models.Model):
     source_hash = models.CharField(max_length=64, blank=True)
     config_hash = models.CharField(max_length=64, blank=True)
     metadata = models.JSONField(default=dict, blank=True)
+    built_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True,
+                                 on_delete=models.SET_NULL, related_name="built_reports")
     approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True,
                                     on_delete=models.SET_NULL, related_name="approved_reports")
     approved_at = models.DateTimeField(null=True, blank=True)
@@ -64,6 +66,7 @@ class DrugUnitReview(models.Model):
     billing_unit = models.CharField(max_length=12)
     status = models.CharField(max_length=24, choices=STATUS_CHOICES)
     notes = models.TextField(blank=True)
+    clinical_reviewer_name = models.CharField(max_length=160, blank=True)
     reviewer = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL,
                                  related_name="drug_unit_reviews")
     reviewed_at = models.DateTimeField(auto_now=True)
