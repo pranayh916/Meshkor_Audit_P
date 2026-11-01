@@ -1,44 +1,38 @@
-# Test and execution report
+# Verification report
 
-**Audit date:** 2026-10-31
-
-## Results
+## Checks completed
 
 | Check | Result |
 |---|---|
-| `python -m pytest -q` | 61 passed, 0 failed, 0 skipped |
-| Django `manage.py check` | Passed, no issues |
-| Django `makemigrations --check --dry-run` | No model changes detected; migration-history lookup warned when run without local DB permission |
-| Safe PostgreSQL migration | `pricing.0005_two_application_roles` applied successfully after local DB authorization |
-| Frontend `npm run build` | Passed; Vite warns entry chunk is 604.09 kB minified (175.36 kB gzip) |
-| `pipeline.run_all` | Exit 0; no independent source failed |
-| `manage.py validate_parquet` | Passed; 623 Parquet files inspected |
-| `python build_market_report.py` | Passed; generated Markdown, CSVs, and dashboard JSON |
-| Live frontend-to-backend health proxy | HTTP 200; API, PostgreSQL, Parquet all `ok` |
-| Django `check --deploy` | Ran; five development-environment HTTPS/DEBUG warnings remain by design |
+| Backend pytest suite | 70 passed |
+| Django system check | Passed: no issues |
+| Frontend production build | Passed with Vite 8.3.5; 651.10 kB minified chunk-size warning |
+| npm dependency audit | Passed: 0 known vulnerabilities |
+| Python dependency audit | Passed: no known vulnerabilities |
+| Live API health | HTTP 200; API, SQLite, and Parquet checks report `ok` |
+| Live frontend | HTTP 200 at `http://127.0.0.1:5173/` |
 
-The pytest API suite uses the isolated SQLite test settings and the marked
-TEST-only fixtures. The application settings remain PostgreSQL-only. The
-successful migration output confirms the live local PostgreSQL role migration
-was applied; no database reset was run. The existing `MeshKor` account is the
-single protected Root Admin. `admin` and `meshkor-admin` remain Admins; the
-existing `viewer` and `analyst` accounts are Viewers. No password was changed
-or disclosed.
+Tests run against isolated test-only inputs; the production report reads the
+stored Parquet snapshot. The test fixtures are not imported into production.
 
-## Coverage
+## Data and release status
 
-Pipeline tests cover Decimal calculations, no second 6%, unit conversion,
-HCPCS/NDC normalization, exact file-quarter selection, unresolved unit status,
-source parsing, and Parquet outputs. API tests cover route responses,
-authentication, role permissions, JWT/session refresh, CSRF, invalid tokens,
-and protected Root Admin behavior. OTP tests are included in the 61 passing
-tests.
+The stored market snapshot contains 20 selected HCPCS drugs, 128 hospital
+keys, and 153,568 comparison observations. There are 7,783 negotiated-dollar
+rows in the current `ok` headline subset. No selected drug currently has the
+required external clinical unit review, so the report remains a draft and is
+not available to Viewer accounts.
 
-## Not run / remaining
+The source CMS Part B file and several other raw inputs are unavailable. The
+current Parquet snapshot retains its source lineage and supports dashboard
+reads; new source imports or a refreshed top-20 scope require the official
+inputs. Hospital identity/coverage is not reconciled to a complete Ohio
+universe.
 
-- No frontend unit/component test runner is configured; `npm run` exposes build
-  and dev scripts only. TypeScript checks do not apply because the app is JSX.
-- No full browser-driven end-to-end session was executed.
-- No third-party vulnerability database scan was run.
-- The report remains draft pending clinical unit review and hospital identifier
-  reconciliation.
+## Not covered by these checks
+
+- A full browser-driven Admin and Viewer end-to-end session.
+- A penetration test.
+- Production HTTPS/deployment configuration.
+- Clinical reviewer identity or clinical judgment; these require a qualified
+  human reviewer.

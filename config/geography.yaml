@@ -1,0 +1,5 @@
+# Ohio is the initial market. Add border ZIP3 values only after the project
+# owner supplies the neighboring ZIP3 list; an empty list means Ohio only.
+state_code: OH
+include_border_zip3: []
+selection_note: "No border ZIP3 codes are configured."

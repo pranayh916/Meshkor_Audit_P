@@ -1,0 +1,8 @@
+# Ohio Type 2 hospital taxonomy values approved for the initial market frame.
+# Extend this list only when an official NPPES taxonomy definition is verified.
+provider_entity_type: "2"
+primary_taxonomy_codes:
+  - "282N00000X"
+  - "282E00000X"
+  - "283Q00000X"
+  - "284300000X"

@@ -34,21 +34,29 @@ from django.db import connections
 from . import data
 from .models import AuditEvent, DrugUnitReview, ProcessingJob, ReportRecord, SourceFile
 from .permissions import ADMIN_GROUP, CanAdminister, CanAnalyze, has_any_role
+from pipeline.common import csv_safe_cell
 
 HEADLINE = "price_type = 'negotiated_dollar' AND status = 'ok'"
+VIEWER_HEADLINE = "price_type = 'negotiated_dollar' AND status = 'ok' AND coalesce(reviewed, false)"
 logger = logging.getLogger(__name__)
 
 RATE_COLUMNS = [
     "hospital_key", "hospital_label", "system", "locations", "hcpcs", "drug_name",
     "description", "ndc11", "matched_via", "setting", "billing_class", "payer_name",
-    "plan_name", "payer_group", "price_type", "price", "drug_unit", "drug_unit_type",
+    "plan_name", "payer_group", "price_type", "price", "gross_charge", "discounted_cash",
+    "negotiated_dollar", "estimated_amount", "median_amount", "p10_amount", "p90_amount",
+    "drug_unit", "drug_unit_type",
     "billing_units", "unit_note", "benchmark_quarter", "asp_payment_limit", "asp_dosage",
     "price_per_billing_unit", "markup_multiple", "pct_over_asp", "negotiated_percentage",
     "methodology", "file_last_updated", "reviewed", "source_file", "source_member",
     "source_sha256", "status",
 ]
+VIEWER_RATE_COLUMNS = [column for column in RATE_COLUMNS if column not in {
+    "source_file", "source_member", "source_sha256",
+}]
 SORTABLE = {"markup_multiple", "price_per_billing_unit", "price", "hospital_label",
             "payer_group", "drug_name", "status"}
+_RATE_SCHEMA_CACHE: tuple[str, int, int, set[str]] | None = None
 
 
 def _missing(e: data.DataMissing) -> Response:
@@ -60,6 +68,51 @@ def _bounded_query_int(request, name: str, default: int, minimum: int, maximum: 
         return min(max(int(request.query_params.get(name, default)), minimum), maximum)
     except (TypeError, ValueError):
         return None
+
+
+def _viewer_release_payload(request):
+    """Return only the current immutable report payload to a Viewer."""
+    if has_any_role(request.user, {ADMIN_GROUP}):
+        return None, None
+    try:
+        source_hash = data.comparison_sha256()
+    except data.DataMissing as exc:
+        return None, Response({"error": str(exc)}, status=503)
+    report = (ReportRecord.objects.filter(source_hash=source_hash,
+                                          config_hash=data.config_sha256(), status="released")
+              .order_by("-generated_at").first())
+    if report is None:
+        return None, Response({"error": "No current report has been released for Viewer access."}, status=403)
+    path = settings.BASE_DIR.parent / "reports" / "dashboard_data.json"
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, ValueError):
+        return None, Response({"error": "The released report artifact is unavailable."}, status=503)
+    expected_digest = (report.metadata or {}).get("dashboard_sha256")
+    if not expected_digest or hashlib.sha256(raw).hexdigest() != expected_digest or payload.get("draft"):
+        return None, Response({"error": "The released report artifact has changed; an Admin must rebuild and release it."}, status=409)
+    payload["clinical_signoffs"] = (report.metadata or {}).get("clinical_signoffs", {})
+    return payload, None
+
+
+def _viewer_dashboard_summary(payload: dict) -> dict:
+    return {
+        "data_evidence_state": "released_report",
+        "generated_at": payload.get("data_build_generated"),
+        "reporting_period": (f"{payload.get('file_date_min')} to {payload.get('file_date_max')}"
+                             if payload.get("file_date_min") else None),
+        "benchmark_quarters_used": ", ".join(payload.get("benchmark_quarters") or []) or None,
+        "latest_asp_quarter": max(payload.get("benchmark_quarters") or [""]) or None,
+        "hospitals_covered": payload.get("hospital_count", 0),
+        "hospitals_with_valid_rates": payload.get("hospital_count", 0),
+        "systems": payload.get("system_count", 0),
+        "drugs_compared": payload.get("drug_count", 0),
+        "headline_rates": payload.get("headline_rows", 0),
+        "validated_comparison_rates": payload.get("headline_rows", 0),
+        "rows": payload.get("comparison_rows", 0),
+        "released_report": True,
+    }
 
 
 def _archive_input_issue(path: Path, config: dict) -> str | None:
@@ -112,6 +165,13 @@ def health(request):
 
 @api_view(["GET"])
 def meta(request):
+    payload, denied = _viewer_release_payload(request)
+    if denied:
+        return denied
+    if payload is not None:
+        summary = _viewer_dashboard_summary(payload)
+        summary["hospitals"] = summary["hospitals_covered"]
+        return Response(summary)
     try:
         info = data.run_info()
         evidence_state = data.require_current_scope()
@@ -130,6 +190,11 @@ def meta(request):
 
 @api_view(["GET"])
 def dashboard_summary(request):
+    payload, denied = _viewer_release_payload(request)
+    if denied:
+        return denied
+    if payload is not None:
+        return Response(_viewer_dashboard_summary(payload))
     try:
         evidence_state = data.require_current_scope()
         info = data.run_info()
@@ -207,7 +272,7 @@ def _count_ohio_hospital_universe():
     config_path = settings.BASE_DIR.parent / "config" / "report.json"
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        spec = next((i for i in config.get("supplemental_inputs", [])
+        spec = next((i for i in config.get("required_inputs", []) + config.get("supplemental_inputs", [])
                      if i.get("key") == "hospital_list"), None)
         if not spec:
             return None
@@ -225,28 +290,36 @@ def _count_ohio_hospital_universe():
 
 @api_view(["GET"])
 def dashboard_price_trends(request):
+    payload, denied = _viewer_release_payload(request)
+    if denied:
+        return denied
+    where = ""
+    params = []
+    if payload is not None:
+        where = ("WHERE status = 'ok' AND coalesce(reviewed, false) "
+                 "AND hcpcs IN (SELECT unnest(?))")
+        params = [payload.get("drug_codes") or []]
     try:
         by_drug = data.query(
             f"""SELECT hcpcs, any_value(drug_name) AS drug_name,
-                       median(markup_multiple) FILTER (WHERE {HEADLINE}) AS median_markup,
-                       count(*) FILTER (WHERE {HEADLINE}) AS rates
-                FROM {{cmp}} GROUP BY hcpcs ORDER BY median_markup DESC NULLS LAST""",
-            cmp="comparison")
+                       median(markup_multiple) AS median_markup, count(*) AS rates
+                FROM {{cmp}} {where} GROUP BY hcpcs ORDER BY median_markup DESC NULLS LAST""",
+            params, cmp="comparison")
         by_payer = data.query(
-            f"""SELECT payer_group, hcpcs, count(*) FILTER (WHERE {HEADLINE}) AS rates,
-                       median(markup_multiple) FILTER (WHERE {HEADLINE}) AS median_markup
-                FROM {{cmp}} GROUP BY payer_group, hcpcs ORDER BY payer_group, median_markup DESC NULLS LAST""",
-            cmp="comparison")
+            f"""SELECT payer_group, hcpcs, count(*) AS rates,
+                       median(markup_multiple) AS median_markup
+                FROM {{cmp}} {where} GROUP BY payer_group, hcpcs ORDER BY payer_group, median_markup DESC NULLS LAST""",
+            params, cmp="comparison")
         by_setting = data.query(
-            f"""SELECT setting, hcpcs, count(*) FILTER (WHERE {HEADLINE}) AS rates,
-                       median(markup_multiple) FILTER (WHERE {HEADLINE}) AS median_markup
-                FROM {{cmp}} GROUP BY setting, hcpcs ORDER BY setting, median_markup DESC NULLS LAST""",
-            cmp="comparison")
+            f"""SELECT setting, hcpcs, count(*) AS rates,
+                       median(markup_multiple) AS median_markup
+                FROM {{cmp}} {where} GROUP BY setting, hcpcs ORDER BY setting, median_markup DESC NULLS LAST""",
+            params, cmp="comparison")
         by_quarter = data.query(
-            f"""SELECT benchmark_quarter, hcpcs, count(*) FILTER (WHERE {HEADLINE}) AS rates,
-                       median(markup_multiple) FILTER (WHERE {HEADLINE}) AS median_markup
-                FROM {{cmp}} GROUP BY benchmark_quarter, hcpcs ORDER BY benchmark_quarter, hcpcs""",
-            cmp="comparison")
+            f"""SELECT benchmark_quarter, hcpcs, count(*) AS rates,
+                       median(markup_multiple) AS median_markup
+                FROM {{cmp}} {where} GROUP BY benchmark_quarter, hcpcs ORDER BY benchmark_quarter, hcpcs""",
+            params, cmp="comparison")
     except data.DataMissing as e:
         return _missing(e)
     return Response({"by_drug": by_drug, "by_payer_group": by_payer,
@@ -484,9 +557,24 @@ def processing_job_detail(request, job_id: int):
 
 @api_view(["GET"])
 def report_records(request):
+    payload, denied = _viewer_release_payload(request)
+    if denied:
+        return denied
     limit = _bounded_query_int(request, "limit", 50, 1, 200)
     if limit is None:
         return Response({"error": "limit must be a whole number."}, status=400)
+    if payload is not None:
+        source_hash = data.comparison_sha256()
+        report = (ReportRecord.objects.filter(source_hash=source_hash, status="released")
+                  .select_related("approved_by").order_by("-generated_at").first())
+        if report is None:
+            return Response([])
+        return Response([{
+            "id": report.pk, "name": report.name, "report_type": report.report_type,
+            "status": "released", "generated_at": report.generated_at,
+            "approved_by": report.approved_by.get_username() if report.approved_by else None,
+            "approved_at": report.approved_at,
+        }])
     return Response([{
         "id": r.pk, "name": r.name, "report_type": r.report_type, "status": r.status,
         "generated_at": r.generated_at, "source_hash": r.source_hash,
@@ -510,6 +598,7 @@ REFERENCE_TABLES = {
 
 
 @api_view(["GET"])
+@permission_classes([CanAdminister])
 def reference_catalog(request):
     """Describe real Parquet reference tables and their loaded coverage."""
     import pyarrow.parquet as parquet
@@ -555,6 +644,7 @@ def reference_catalog(request):
 
 
 @api_view(["GET"])
+@permission_classes([CanAdminister])
 def reference_table(request, dataset_name: str):
     """Search and page through an allow-listed analytical Parquet table."""
     import duckdb
@@ -611,6 +701,7 @@ def reference_table(request, dataset_name: str):
 
 
 @api_view(["GET"])
+@permission_classes([CanAdminister])
 def drug_scope_status(request):
     from pipeline.common import paths
     scope_path = paths()["ref"] / "drug_scope.parquet"
@@ -626,10 +717,14 @@ def drug_scope_status(request):
         reviews = {row["hcpcs"]: row for row in DrugUnitReview.objects.filter(
             scope_source_sha256=info.get("drug_selection_source_sha256")).values(
                 "hcpcs", "status", "notes", "billing_qty", "billing_unit", "reviewed_at",
-                "reviewer__username")}
+                "clinical_reviewer_name", "reviewer__username")}
         for drug in scope.values():
             review = reviews.get(drug["hcpcs"])
-            drug["unit_review"] = review
+            if has_any_role(request.user, {ADMIN_GROUP}):
+                drug["unit_review"] = review
+            else:
+                drug.pop("unit_review", None)
+                drug.pop("reviewed_by", None)
         return Response({"status": "selected", "source": info.get("drug_selection_source"),
                          "source_file": info.get("drug_selection_source_file"),
                          "source_sha256": info.get("drug_selection_source_sha256"),
@@ -644,7 +739,7 @@ def drug_scope_status(request):
 @api_view(["POST"])
 @permission_classes([CanAnalyze])
 def review_drug_unit(request, hcpcs: str):
-    """Record an analyst's review of the ASP billing unit for this exact scope source."""
+    """Record an Admin-submitted external clinical review for the exact scope source."""
     from decimal import Decimal, InvalidOperation
     from pipeline.common import parse_hcpcs_dosage, paths
 
@@ -661,8 +756,11 @@ def review_drug_unit(request, hcpcs: str):
     if decision not in {"validated", "rejected", "unit_unresolved"}:
         return Response({"error": "status must be validated, rejected, or unit_unresolved."}, status=400)
     note = str(request.data.get("notes", "")).strip()[:4000]
-    if decision != "validated" and len(note) < 10:
-        return Response({"error": "Add a reviewer note explaining a rejection or unresolved unit."}, status=400)
+    clinical_reviewer_name = str(request.data.get("clinical_reviewer_name", "")).strip()[:160]
+    if len(clinical_reviewer_name) < 3:
+        return Response({"error": "Enter the external pharmacist or clinical reviewer’s name."}, status=400)
+    if len(note) < 10:
+        return Response({"error": "Add the reviewer’s evidence and rationale (at least 10 characters)."}, status=400)
     dose = parse_hcpcs_dosage(drug.get("asp_dosage") or "")
     if not dose:
         return Response({"error": "CMS ASP dosage does not provide a verifiable billing unit."}, status=422)
@@ -677,7 +775,8 @@ def review_drug_unit(request, hcpcs: str):
     review, _ = DrugUnitReview.objects.update_or_create(
         hcpcs=code, scope_source_sha256=info["drug_selection_source_sha256"],
         defaults={"billing_qty": quantity, "billing_unit": unit, "status": decision,
-                  "notes": note, "reviewer": request.user},
+                  "notes": note, "reviewer": request.user,
+                  "clinical_reviewer_name": clinical_reviewer_name},
     )
     AuditEvent.objects.create(actor=request.user, action="drug_unit_reviewed", entity_type="drug",
                               entity_id=code, details={"status": decision,
@@ -693,26 +792,28 @@ def review_drug_unit(request, hcpcs: str):
                 .select_related("reviewer").order_by("hcpcs"))
     try:
         with temp.open("w", newline="", encoding="utf-8-sig") as stream:
-            writer = csv.DictWriter(stream, fieldnames=["HCPCS_Cd", "reviewed_by", "billing_unit",
-                "billing_unit_qty", "selection_source_sha256", "review_status", "review_notes"])
+            writer = csv.DictWriter(stream, fieldnames=["HCPCS_Cd", "reviewed_by", "recorded_by",
+                "billing_unit", "billing_unit_qty", "selection_source_sha256", "review_status", "review_notes"])
             writer.writeheader()
             for row in rows:
-                if row.status != "validated":
-                    continue
-                writer.writerow({"HCPCS_Cd": row.hcpcs,
-                    "reviewed_by": row.reviewer.get_username() if row.reviewer else "unknown",
+                values = {"HCPCS_Cd": row.hcpcs,
+                    "reviewed_by": row.clinical_reviewer_name,
+                    "recorded_by": row.reviewer.get_username() if row.reviewer else "unknown",
                     "billing_unit": row.billing_unit, "billing_unit_qty": row.billing_qty,
                     "selection_source_sha256": row.scope_source_sha256,
-                    "review_status": row.status, "review_notes": row.notes})
+                    "review_status": row.status, "review_notes": row.notes}
+                writer.writerow({key: csv_safe_cell(value) for key, value in values.items()})
         os.replace(temp, export)
     finally:
         temp.unlink(missing_ok=True)
     return Response({"hcpcs": review.hcpcs, "status": review.status, "notes": review.notes,
+                     "clinical_reviewer_name": review.clinical_reviewer_name,
                      "reviewer": request.user.get_username(), "reviewed_at": review.reviewed_at,
                      "scope_source_sha256": review.scope_source_sha256}, status=200)
 
 
 @api_view(["GET"])
+@permission_classes([CanAdminister])
 def unit_validations(request):
     try:
         rows = data.query(
@@ -727,19 +828,23 @@ def unit_validations(request):
             "GROUP BY hcpcs, hospital_key ORDER BY status, hcpcs, hospital_label LIMIT 2000",
             cmp="comparison")
         return Response({"status": "loaded", "rows": rows, "total": len(rows),
-                         "review_workflow": "Manual reviewer decisions are not yet recorded in the app."})
+                         "review_workflow": "Admin must record an external clinical reviewer and evidence for each selected drug."})
     except data.DataMissing as exc:
         return Response({"status": "blocked", "reason": str(exc), "rows": [], "total": 0,
-                         "review_workflow": "Manual reviewer decisions are not yet recorded in the app."})
+                         "review_workflow": "Admin must record an external clinical reviewer and evidence for each selected drug."})
 
 
 @api_view(["GET"])
+@permission_classes([CanAdminister])
 def application_settings(request):
     project_dir = settings.BASE_DIR.parent
     try:
         report = json.loads((project_dir / "config" / "report.json").read_text(encoding="utf-8"))
         pipeline = __import__("yaml").safe_load((project_dir / "config" / "pipeline.yaml").read_text(encoding="utf-8"))
         taxonomy = __import__("yaml").safe_load((project_dir / "config" / "hospital_taxonomy.yaml").read_text(encoding="utf-8"))
+        taxonomy_codes = __import__("yaml").safe_load((project_dir / "config" / "hospital_taxonomies.yaml").read_text(encoding="utf-8"))
+        geography = __import__("yaml").safe_load((project_dir / "config" / "geography.yaml").read_text(encoding="utf-8"))
+        units = __import__("yaml").safe_load((project_dir / "config" / "units.yaml").read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return Response({"error": f"Configuration could not be read: {exc}"}, status=503)
     return Response({"report": {"title": report.get("title"), "target_drug_count": report.get("target_drug_count"),
@@ -747,7 +852,9 @@ def application_settings(request):
                                  "supplemental_inputs": report.get("supplemental_inputs")},
                      "comparison": {"review_range": pipeline.get("review_range"),
                                     "benchmark_quarter": pipeline.get("benchmark_quarter")},
-                     "hospital_taxonomy": taxonomy,
+                     "hospital_taxonomy": {**taxonomy, "taxonomy_codes": taxonomy_codes.get("primary_taxonomy_codes", []),
+                                            "border_zip3": geography.get("include_border_zip3", [])},
+                     "units": units,
                      "database_backend": settings.DATABASES["default"]["ENGINE"],
                      "plan_specific_audit": "planned; raw claims remain client-side"})
 
@@ -768,6 +875,10 @@ def audit_logs(request):
 
 @api_view(["GET"])
 def drugs(request):
+    payload, denied = _viewer_release_payload(request)
+    if denied:
+        return denied
+    headline_filter = VIEWER_HEADLINE if payload is not None else HEADLINE
     try:
         cfg = data.drug_config()
         latest = data.query(
@@ -775,16 +886,19 @@ def drugs(request):
             "WHERE hcpcs IN (SELECT unnest(?)) "
             "QUALIFY row_number() OVER (PARTITION BY hcpcs ORDER BY quarter DESC) = 1",
             [list(cfg)], asp="asp")
+        spend_rows = data.query(
+            "SELECT hcpcs, partb_spending FROM {scope} WHERE hcpcs IN (SELECT unnest(?))",
+            [list(cfg)], scope="scope")
         stats = data.query(
             f"""SELECT hcpcs,
-                   count(DISTINCT hospital_key) FILTER (WHERE {HEADLINE}) AS hospitals_priced,
-                   count(*) FILTER (WHERE {HEADLINE}) AS rates,
-                   median(price_per_billing_unit) FILTER (WHERE {HEADLINE}) AS median_hospital_price,
-                   median(asp_payment_limit) FILTER (WHERE {HEADLINE}) AS asp_payment_limit_used,
-                   any_value(benchmark_quarter) FILTER (WHERE {HEADLINE}) AS benchmark_quarter_used,
-                   median(markup_multiple) FILTER (WHERE {HEADLINE}) AS median_markup,
-                   min(markup_multiple) FILTER (WHERE {HEADLINE}) AS min_markup,
-                   max(markup_multiple) FILTER (WHERE {HEADLINE}) AS max_markup,
+                   count(DISTINCT hospital_key) FILTER (WHERE {headline_filter}) AS hospitals_priced,
+                   count(*) FILTER (WHERE {headline_filter}) AS rates,
+                   median(price_per_billing_unit) FILTER (WHERE {headline_filter}) AS median_hospital_price,
+                   median(asp_payment_limit) FILTER (WHERE {headline_filter}) AS asp_payment_limit_used,
+                   any_value(benchmark_quarter) FILTER (WHERE {headline_filter}) AS benchmark_quarter_used,
+                   median(markup_multiple) FILTER (WHERE {headline_filter}) AS median_markup,
+                   min(markup_multiple) FILTER (WHERE {headline_filter}) AS min_markup,
+                   max(markup_multiple) FILTER (WHERE {headline_filter}) AS max_markup,
                    count(*) FILTER (WHERE status = 'review_range') AS review_rows,
                    count(*) FILTER (WHERE status = 'unit_unresolved') AS unresolved_unit_rows,
                    count(*) FILTER (WHERE status NOT IN ('ok','review_range')) AS excluded_rows
@@ -792,11 +906,13 @@ def drugs(request):
     except data.DataMissing as e:
         return _missing(e)
     asp = {r["hcpcs"]: r for r in latest}
+    spending = {r["hcpcs"]: r.get("partb_spending") for r in spend_rows}
     st = {r["hcpcs"]: r for r in stats}
+    clinical_signoffs = (payload or {}).get("clinical_signoffs", {})
     out = []
     for code, d in cfg.items():
         a, s = asp.get(code, {}), st.get(code, {})
-        out.append({
+        result = {
             "hcpcs": code, "name": d["name"], "brand": d.get("brand"),
             "billing_unit": f'{d["billing_unit"]["qty"]:g} {d["billing_unit"]["unit"]}',
             "reviewed_by": d.get("reviewed_by"),
@@ -811,22 +927,46 @@ def drugs(request):
             "max_markup": s.get("max_markup"), "review_rows": s.get("review_rows", 0),
             "unresolved_unit_rows": s.get("unresolved_unit_rows", 0),
             "excluded_rows": s.get("excluded_rows", 0),
-        })
+        }
+        result["partb_spending_proxy"] = spending.get(code)
+        if result["partb_spending_proxy"] is not None and s.get("median_markup") is not None:
+            result["estimated_dollars_at_stake_proxy"] = max(
+                0, (float(s["median_markup"]) - 1) * float(result["partb_spending_proxy"]))
+        else:
+            result["estimated_dollars_at_stake_proxy"] = None
+        if payload is not None:
+            result.pop("reviewed_by", None)
+            result.pop("review_rows", None)
+            result.pop("unresolved_unit_rows", None)
+            result.pop("excluded_rows", None)
+            clinical = clinical_signoffs.get(code)
+            result["verification_status"] = "verified" if clinical else "pending clinical review"
+            result["clinical_reviewer_name"] = clinical.get("reviewer_name") if clinical else None
+            result["clinical_reviewed_at"] = clinical.get("reviewed_at") if clinical else None
+        out.append(result)
     return Response(out)
 
 
 @api_view(["GET"])
 def drug_detail(request, hcpcs: str):
+    payload, denied = _viewer_release_payload(request)
+    if denied:
+        return denied
+    headline_filter = VIEWER_HEADLINE if payload is not None else HEADLINE
     try:
         cfg = data.drug_config()
+        run = data.run_info()
     except data.DataMissing as e:
         return _missing(e)
     code = hcpcs.upper()
     if code not in cfg:
         return Response({"error": f"{code} is not in the CMS Part B selected scope."}, status=404)
+    if payload is not None and code not in (payload.get("drug_codes") or []):
+        return Response({"error": "This drug is not included in the current released report."}, status=404)
     try:
-        asp = data.query("SELECT quarter, payment_limit, dosage_text, short_description, "
-                         "source_file, source_sha256 FROM {asp} WHERE hcpcs = ? ORDER BY quarter",
+        asp_columns = ("quarter, payment_limit, dosage_text, short_description" if payload is not None else
+                       "quarter, payment_limit, dosage_text, short_description, source_file, source_sha256")
+        asp = data.query(f"SELECT {asp_columns} FROM {{asp}} WHERE hcpcs = ? ORDER BY quarter",
                          [code], asp="asp")
         hospitals = data.query(
             f"""SELECT hospital_key, any_value(hospital_label) AS hospital_label,
@@ -837,25 +977,40 @@ def drug_detail(request, hcpcs: str):
                    median(price_per_billing_unit) AS median_price_per_unit,
                    any_value(asp_payment_limit) AS asp_payment_limit,
                    any_value(benchmark_quarter) AS benchmark_quarter
-                FROM {{cmp}} WHERE hcpcs = ? AND {HEADLINE}
+                FROM {{cmp}} WHERE hcpcs = ? AND {headline_filter}
                 GROUP BY hospital_key ORDER BY median_markup DESC""", [code], cmp="comparison")
         payers = data.query(
             f"""SELECT payer_group, count(*) AS rates, count(DISTINCT hospital_key) AS hospitals,
                    median(markup_multiple) AS median_markup,
                    min(markup_multiple) AS min_markup, max(markup_multiple) AS max_markup
-                FROM {{cmp}} WHERE hcpcs = ? AND {HEADLINE}
+                FROM {{cmp}} WHERE hcpcs = ? AND {headline_filter}
                 GROUP BY 1 ORDER BY median_markup DESC""", [code], cmp="comparison")
-        statuses = data.query("SELECT status, count(*) AS n FROM {cmp} WHERE hcpcs = ? "
-                              "GROUP BY 1 ORDER BY 2 DESC", [code], cmp="comparison")
+        statuses = ([] if payload is not None else data.query(
+            "SELECT status, count(*) AS n FROM {cmp} WHERE hcpcs = ? "
+            "GROUP BY 1 ORDER BY 2 DESC", [code], cmp="comparison"))
     except data.DataMissing as e:
         return _missing(e)
     d = cfg[code]
-    return Response({
+    result = {
         "hcpcs": code, "name": d["name"], "brand": d.get("brand"),
         "billing_unit": f'{d["billing_unit"]["qty"]:g} {d["billing_unit"]["unit"]}',
         "reviewed_by": d.get("reviewed_by"),
         "asp": asp, "hospitals": hospitals, "payers": payers, "statuses": statuses,
-    })
+    }
+    if payload is not None:
+        clinical = (payload.get("clinical_signoffs") or {}).get(code)
+        result["clinical_reviewer_name"] = clinical.get("reviewer_name") if clinical else None
+        result["clinical_reviewed_at"] = clinical.get("reviewed_at") if clinical else None
+        result["verification_status"] = "verified" if clinical else "pending clinical review"
+        result.pop("reviewed_by", None)
+    else:
+        clinical = DrugUnitReview.objects.filter(
+            hcpcs=code, scope_source_sha256=run.get("drug_selection_source_sha256")
+        ).first()
+        result["clinical_reviewer_name"] = clinical.clinical_reviewer_name if clinical else None
+        result["clinical_reviewed_at"] = clinical.reviewed_at.isoformat() if clinical else None
+        result["verification_status"] = clinical.status if clinical else "pending clinical review"
+    return Response(result)
 
 
 def _hospital_file_key(system: str, source_file: str, source_member: str) -> str:
@@ -881,19 +1036,30 @@ def _hospital_quality_fields(row: dict) -> dict:
 
 @api_view(["GET"])
 def hospitals(request):
+    payload, denied = _viewer_release_payload(request)
+    if denied:
+        return denied
+    headline_filter = VIEWER_HEADLINE if payload is not None else HEADLINE
+    review_counts = ("0 AS review_rows, 0 AS excluded_rows" if payload is not None else
+                     "count(*) FILTER (WHERE status = 'review_range') AS review_rows, "
+                     "count(*) FILTER (WHERE status NOT IN ('ok','review_range')) AS excluded_rows")
     try:
         rows = data.query(
             f"""SELECT hospital_key, any_value(hospital_label) AS hospital_label,
                    any_value(system) AS system, any_value(locations) AS locations,
                    any_value(file_last_updated) AS file_last_updated,
-                   count(DISTINCT hcpcs) FILTER (WHERE {HEADLINE}) AS drugs_priced,
-                   count(*) FILTER (WHERE {HEADLINE}) AS rates,
-                   median(markup_multiple) FILTER (WHERE {HEADLINE}) AS median_markup,
-                   max(markup_multiple) FILTER (WHERE {HEADLINE}) AS max_markup,
-                   count(*) FILTER (WHERE status = 'review_range') AS review_rows,
-                   count(*) FILTER (WHERE status NOT IN ('ok','review_range')) AS excluded_rows
+                   count(DISTINCT hcpcs) FILTER (WHERE {headline_filter}) AS drugs_priced,
+                   count(*) FILTER (WHERE {headline_filter}) AS rates,
+                   median(markup_multiple) FILTER (WHERE {headline_filter}) AS median_markup,
+                   max(markup_multiple) FILTER (WHERE {headline_filter}) AS max_markup,
+                   {review_counts}
                 FROM {{cmp}} GROUP BY hospital_key
+                HAVING count(*) FILTER (WHERE {headline_filter}) > 0
                 ORDER BY median_markup DESC NULLS LAST""", cmp="comparison")
+        if payload is not None:
+            for row in rows:
+                row["file_status"] = "rates_found"
+            return Response(rows)
         quality_rows = data.query("SELECT * FROM {quality} ORDER BY system, source_file, source_member",
                                   quality="quality")
     except data.DataMissing as e:
@@ -945,6 +1111,10 @@ def hospitals(request):
 
 @api_view(["GET"])
 def hospital_detail(request, hospital_key: str):
+    payload, denied = _viewer_release_payload(request)
+    if denied:
+        return denied
+    headline_filter = VIEWER_HEADLINE if payload is not None else HEADLINE
     try:
         drugs_ = data.query(
             f"""SELECT hcpcs, any_value(drug_name) AS drug_name, count(*) AS rates,
@@ -952,18 +1122,26 @@ def hospital_detail(request, hospital_key: str):
                    min(markup_multiple) AS min_markup, max(markup_multiple) AS max_markup,
                    any_value(asp_payment_limit) AS asp_payment_limit,
                    median(price_per_billing_unit) AS median_price_per_unit
-                FROM {{cmp}} WHERE hospital_key = ? AND {HEADLINE}
+                FROM {{cmp}} WHERE hospital_key = ? AND {headline_filter}
                 GROUP BY hcpcs ORDER BY median_markup DESC""", [hospital_key], cmp="comparison")
-        info = data.query("SELECT any_value(hospital_label) AS hospital_label, "
-                          "any_value(system) AS system, any_value(locations) AS locations, "
-                          "any_value(file_last_updated) AS file_last_updated, "
-                          "any_value(source_file) AS source_file, "
-                          "any_value(source_sha256) AS source_sha256, "
-                          "count(*) AS n_rows FROM {cmp} WHERE hospital_key = ?",
-                          [hospital_key], cmp="comparison")
-        statuses = data.query("SELECT status, count(*) AS n FROM {cmp} WHERE hospital_key = ? "
-                              "GROUP BY 1 ORDER BY 2 DESC", [hospital_key], cmp="comparison")
-        quality_rows = data.query("SELECT * FROM {quality}", quality="quality")
+        if payload is not None:
+            info = data.query("SELECT any_value(hospital_label) AS hospital_label, "
+                              "any_value(system) AS system, any_value(locations) AS locations, "
+                              "any_value(file_last_updated) AS file_last_updated, count(*) AS n_rows "
+                              "FROM {cmp} WHERE hospital_key = ? AND " + headline_filter,
+                              [hospital_key], cmp="comparison")
+            statuses, quality_rows = [], []
+        else:
+            info = data.query("SELECT any_value(hospital_label) AS hospital_label, "
+                              "any_value(system) AS system, any_value(locations) AS locations, "
+                              "any_value(file_last_updated) AS file_last_updated, "
+                              "any_value(source_file) AS source_file, "
+                              "any_value(source_sha256) AS source_sha256, "
+                              "count(*) AS n_rows FROM {cmp} WHERE hospital_key = ?",
+                              [hospital_key], cmp="comparison")
+            statuses = data.query("SELECT status, count(*) AS n FROM {cmp} WHERE hospital_key = ? "
+                                  "GROUP BY 1 ORDER BY 2 DESC", [hospital_key], cmp="comparison")
+            quality_rows = data.query("SELECT * FROM {quality}", quality="quality")
     except data.DataMissing as e:
         return _missing(e)
     if not info or not info[0]["n_rows"]:
@@ -987,7 +1165,11 @@ def hospital_detail(request, hospital_key: str):
             "statuses": [],
             **_hospital_quality_fields(quality_row),
         })
-    return Response({**info[0], "hospital_key": hospital_key, "drugs": drugs_, "statuses": statuses})
+    result = {**info[0], "hospital_key": hospital_key, "drugs": drugs_, "statuses": statuses}
+    if payload is not None:
+        result.pop("n_rows", None)
+        result["rates"] = sum(row.get("rates", 0) for row in drugs_)
+    return Response(result)
 
 
 def _rate_filters(request) -> tuple[str, list]:
@@ -1006,9 +1188,51 @@ def _rate_filters(request) -> tuple[str, list]:
     return ("WHERE " + " AND ".join(where)) if where else "", params
 
 
+def _comparison_column_names() -> set[str]:
+    """Read the Parquet schema so older verified snapshots remain readable."""
+    import duckdb
+
+    global _RATE_SCHEMA_CACHE
+    path = data.files()["comparison"]
+    stat = path.stat()
+    cache = _RATE_SCHEMA_CACHE
+    if cache and cache[:3] == (str(path), stat.st_size, stat.st_mtime_ns):
+        return cache[3]
+    connection = duckdb.connect()
+    try:
+        columns = {row[0] for row in connection.execute(
+            "DESCRIBE SELECT * FROM read_parquet(?)", [path.as_posix()]).fetchall()}
+    finally:
+        connection.close()
+    _RATE_SCHEMA_CACHE = (str(path), stat.st_size, stat.st_mtime_ns, columns)
+    return columns
+
+
+def _authorized_rate_filters(request):
+    payload, denied = _viewer_release_payload(request)
+    if denied:
+        return None, None, None, denied
+    where, params = _rate_filters(request)
+    permitted = RATE_COLUMNS if payload is None else VIEWER_RATE_COLUMNS
+    try:
+        available = _comparison_column_names()
+    except (OSError, RuntimeError, data.DataMissing) as exc:
+        return payload, None, None, Response({"error": str(exc)}, status=503)
+    columns = [column for column in permitted if column in available]
+    if payload is not None:
+        fixed = ("coalesce(reviewed, false) AND status NOT IN "
+                 "('unit_unresolved','unit_ambiguous','billing_unit_mismatch') "
+                 "AND hcpcs IN (SELECT unnest(?))")
+        where = f"{where} AND {fixed}" if where else f"WHERE {fixed}"
+        params.append(payload.get("drug_codes") or [])
+    return payload, where, params, columns
+
+
 @api_view(["GET"])
 def rates(request):
-    where, params = _rate_filters(request)
+    payload, where, params, columns = _authorized_rate_filters(request)
+    if isinstance(columns, Response):
+        return columns
     sort = request.GET.get("sort", "markup_multiple")
     sort = sort if sort in SORTABLE else "markup_multiple"
     order = "ASC" if request.GET.get("order") == "asc" else "DESC"
@@ -1017,7 +1241,7 @@ def rates(request):
         offset = max(int(request.GET.get("offset", 0)), 0)
     except (TypeError, ValueError):
         return Response({"error": "limit and offset must be whole numbers."}, status=400)
-    cols = ", ".join(RATE_COLUMNS)
+    cols = ", ".join(columns)
     try:
         total = data.query(f"SELECT count(*) AS n FROM {{cmp}} {where}", params,
                            cmp="comparison")[0]["n"]
@@ -1031,9 +1255,11 @@ def rates(request):
 
 @api_view(["GET"])
 def rates_csv(request):
-    where, params = _rate_filters(request)
+    payload, where, params, columns = _authorized_rate_filters(request)
+    if isinstance(columns, Response):
+        return columns
     try:
-        rows = data.query(f"SELECT {', '.join(RATE_COLUMNS)} FROM {{cmp}} {where} "
+        rows = data.query(f"SELECT {', '.join(columns)} FROM {{cmp}} {where} "
                           "ORDER BY hcpcs, markup_multiple DESC NULLS LAST", params,
                           cmp="comparison")
         info = data.run_info()
@@ -1042,21 +1268,24 @@ def rates_csv(request):
     buf = io.StringIO()
     buf.write(f"# Infusion Drug Markup Audit export. Pipeline run {info['generated_at']}. "
               "Markup = price per HCPCS billing unit / CMS ASP payment limit (ASP+6%).\n")
-    w = csv.DictWriter(buf, fieldnames=RATE_COLUMNS)
+    w = csv.DictWriter(buf, fieldnames=columns)
     w.writeheader()
-    w.writerows(rows)
+    w.writerows({column: csv_safe_cell(row.get(column)) for column in columns} for row in rows)
     resp = HttpResponse(buf.getvalue(), content_type="text/csv")
-    resp["Content-Disposition"] = 'attachment; filename="infusion_audit_rates.csv"'
+    resp["Content-Disposition"] = 'attachment; filename="infusion_audit_report_appendix.csv"'
     return resp
 
 
 @api_view(["GET"])
+@permission_classes([CanAdminister])
 def rates_xlsx(request):
     """Stream a filtered comparison export without building a Python row list."""
     import duckdb
     from openpyxl import Workbook
 
-    where, params = _rate_filters(request)
+    payload, where, params, columns = _authorized_rate_filters(request)
+    if isinstance(columns, Response):
+        return columns
     try:
         data.require_current_scope()
         path = data.files()["comparison"]
@@ -1068,13 +1297,13 @@ def rates_xlsx(request):
                 return Response({"error": "This result exceeds Excel's worksheet row limit; narrow the filters."},
                                 status=413)
             cursor = con.execute(
-                f"SELECT {', '.join(RATE_COLUMNS)} FROM read_parquet(?) {where} "
+                f"SELECT {', '.join(columns)} FROM read_parquet(?) {where} "
                 "ORDER BY hcpcs, markup_multiple DESC NULLS LAST",
                 [path.as_posix(), *params])
             output = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
             workbook = Workbook(write_only=True)
             sheet = workbook.create_sheet("Comparisons")
-            sheet.append(RATE_COLUMNS)
+            sheet.append(columns)
             while batch := cursor.fetchmany(2000):
                 for row in batch:
                     sheet.append([("'" + value if isinstance(value, str) and
@@ -1093,6 +1322,7 @@ def rates_xlsx(request):
 
 
 @api_view(["GET"])
+@permission_classes([CanAdminister])
 def quality(request):
     try:
         rows = data.query("SELECT * FROM {quality} ORDER BY system, source_file", quality="quality")
@@ -1103,6 +1333,9 @@ def quality(request):
 
 @api_view(["GET"])
 def report_pdf(request):
+    payload, denied = _viewer_release_payload(request)
+    if denied:
+        return denied
     from .auth_views import signoff_status
     from .report import build_pdf
     codes = [c.strip().upper() for c in request.GET.get("hcpcs", "").split(",") if c.strip()]
@@ -1114,7 +1347,9 @@ def report_pdf(request):
         return _missing(e)
     except RuntimeError as e:
         return Response({"error": str(e)}, status=503)
-    tag = "signed" if status["signed"] else "DRAFT"
+    if payload is not None and not status["signed"]:
+        return Response({"error": "Only a current released report is available to Viewers."}, status=403)
+    tag = "RELEASED" if status["signed"] else "DRAFT"
     name = f"ohio_infusion_markup_report_{status['generated_at'][:10]}_{tag}.pdf"
     resp = HttpResponse(pdf, content_type="application/pdf")
     resp["Content-Disposition"] = f'attachment; filename="{name}"'

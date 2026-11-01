@@ -1,8 +1,8 @@
 """Django settings for the Infusion Drug Markup Audit API.
 
 Price data lives in Parquet files built by the pipeline (data/mart, data/ref,
-data/hpt/norm) and is read through DuckDB. PostgreSQL stores app users, roles,
-uploaded-source records, jobs, reports, reviews, and audit events.
+data/hpt/norm) and is read through DuckDB. SQLite stores users, roles, jobs,
+reports, reviews, and audit events; bulk rates stay in Parquet.
 """
 import os
 import secrets
@@ -68,19 +68,13 @@ TEMPLATES = [{
     ]},
 }]
 
-POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
-if not POSTGRES_PASSWORD:
-    raise ImproperlyConfigured(
-        "POSTGRES_PASSWORD is required. Add your PostgreSQL password to the project .env file."
-    )
+OPERATIONAL_DB_PATH = Path(os.environ.get(
+    "OPERATIONAL_DB_PATH", str(PROJECT_DIR / "data" / "operational" / "meshkor.sqlite3")))
+OPERATIONAL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 DATABASES = {"default": {
-    "ENGINE": "django.db.backends.postgresql",
-    "NAME": os.environ.get("POSTGRES_DB", "infusion_audit"),
-    "USER": os.environ.get("POSTGRES_USER", "meshkor"),
-    "PASSWORD": POSTGRES_PASSWORD,
-    "HOST": os.environ.get("POSTGRES_HOST", "127.0.0.1"),
-    "PORT": os.environ.get("POSTGRES_PORT", "5432"),
-    "CONN_MAX_AGE": 60,
+    "ENGINE": "django.db.backends.sqlite3",
+    "NAME": str(OPERATIONAL_DB_PATH),
+    "OPTIONS": {"timeout": 30},
 }}
 
 AUTH_PASSWORD_VALIDATORS = [
@@ -120,11 +114,7 @@ TOTP_ENCRYPTION_KEY = os.environ.get("TOTP_ENCRYPTION_KEY", "")
 # Login attempts: this many failures per username + address in the window -> blocked.
 LOGIN_MAX_FAILURES = 5
 LOGIN_WINDOW_SECONDS = 15 * 60
-CACHES = {"default": (
-    {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}
-    if DEBUG else
-    {"BACKEND": "django.core.cache.backends.db.DatabaseCache", "LOCATION": "django_cache"}
-)}
+CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
 
 # The Vite dev server is allowed only in debug mode unless production origins
 # are explicitly configured.

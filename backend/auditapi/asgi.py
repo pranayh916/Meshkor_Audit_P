@@ -1,16 +1,8 @@
-"""
-ASGI config for auditapi project.
-
-It exposes the ASGI callable as a module-level variable named ``application``.
-
-For more information on this file, see
-https://docs.djangoproject.com/en/6.1/howto/deployment/asgi/
-"""
-
+"""Django's native ASGI application, served by Uvicorn."""
 import os
 
-from django.core.asgi import get_asgi_application
-
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "auditapi.settings")
+
+from django.core.asgi import get_asgi_application
 
 application = get_asgi_application()

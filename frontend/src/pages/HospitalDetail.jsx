@@ -3,7 +3,8 @@ import { fmt, useApi } from "../api.js";
 import { Loading, StatusPill, Table } from "../components.jsx";
 import RatesTable from "./RatesTable.jsx";
 
-export default function HospitalDetail() {
+export default function HospitalDetail({ user }) {
+  const isAdmin = user?.roles?.includes("Admin");
   const { key } = useParams();
   const h = useApi(`hospitals/${key}`, null, [key]);
   return (
@@ -14,17 +15,17 @@ export default function HospitalDetail() {
             <div className="crumb"><Link to="/hospitals">Hospitals</Link> / {d.hospital_label}</div>
             <h1>{d.hospital_label}</h1>
             <p className="lede">{d.system} · file dated {d.file_last_updated || "not stated"}</p>
-            {d.locations && <p className="muted">Locations on this file: {d.locations}</p>}
-            {d.file_status && <p className={d.file_error ? "note error" : "muted"}>
+            {d.locations && <p className="muted">{isAdmin ? "Locations on this file:" : "Locations:"} {d.locations}</p>}
+            {isAdmin && d.file_status && <p className={d.file_error ? "note error" : "muted"}>
               File status: {d.file_status.replaceAll("_", " ")} · {d.items_scanned ?? 0} items scanned · {d.drug_rows ?? d.n_rows ?? 0} selected-drug rows
               {d.file_error ? ` · ${d.file_error}` : ""}
             </p>}
-            <p className="muted mono">{d.source_file}</p>
-            <div className="status-row">
+            {isAdmin && <p className="muted mono">{d.source_file}</p>}
+            {isAdmin && <div className="status-row">
               {d.statuses.map((s) => (
                 <span key={s.status}><StatusPill status={s.status} /> {fmt.n(s.n)}</span>
               ))}
-            </div>
+            </div>}
           </section>
           <section>
             <h2>Drugs</h2>
@@ -45,9 +46,9 @@ export default function HospitalDetail() {
               ]} />
           </section>
           <section>
-            <h2>Every rate in this file</h2>
+            <h2>{isAdmin ? "Every rate in this file" : "Released price comparisons"}</h2>
             {d.n_rows === 0 ? <p className="note">This file has no comparison rows. See its import status above and the Data Quality page for details.</p>
-              : <RatesTable fixed={{ hospital_key: key }} />}
+              : <RatesTable fixed={{ hospital_key: key }} user={user} />}
           </section>
         </>
       )}

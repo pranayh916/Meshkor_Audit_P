@@ -1,6 +1,8 @@
 """Pipeline tests on made-up TEST data (see conftest.py). Expected values are hand-computed."""
 from datetime import date
 from io import BytesIO
+import csv
+import hashlib
 import json
 from pathlib import Path
 from decimal import Decimal
@@ -8,9 +10,10 @@ from decimal import Decimal
 import polars as pl
 import pytest
 
-from pipeline.common import (Dose, billing_units, hospital_dose, norm_hcpcs, norm_ndc,
+from pipeline.common import (Dose, billing_units, csv_safe_cell, hospital_dose, norm_hcpcs, norm_ndc,
                              parse_hcpcs_dosage, payer_group, quarter_from_filename)
 from pipeline.load_asp import classify
+from pipeline.select_drugs import apply_saved_scope_reviews
 from pipeline.build_compare import comparison_metrics, resolve_benchmark_quarter
 from pipeline.parse_hpt import _json_stream
 
@@ -25,6 +28,16 @@ def test_comparison_financial_math_uses_decimal_and_rejects_invalid_inputs():
     assert percent == Decimal("17.92452830188679245283018870")
     with pytest.raises(ValueError, match="greater than zero"):
         comparison_metrics("10", "1", "0")
+
+
+@pytest.mark.parametrize("raw", ["=HYPERLINK(\"https://bad.example\")", "+1+1", "@SUM(1,1)", "\t=1+1", "\r\n-1+1"])
+def test_csv_exports_neutralize_spreadsheet_formulas(raw):
+    assert csv_safe_cell(raw) == "'" + raw
+
+
+def test_csv_safe_cell_leaves_numbers_and_plain_text_unchanged():
+    assert csv_safe_cell(-1.25) == -1.25
+    assert csv_safe_cell("ordinary text") == "ordinary text"
 
 
 def test_file_date_quarter_does_not_fall_back_to_latest_asp():
@@ -212,3 +225,48 @@ def test_non_drug_rows_and_part_files_skipped(built):
     q = pl.read_parquet(built / "data/hpt/norm/hpt_file_quality.parquet")
     assert not any(s.endswith(".part") for s in q["source_file"])
     assert q["error"].null_count() == len(q)
+
+
+def test_saved_scope_applies_validated_and_rejected_reviews_without_raw_spend_file(tmp_path):
+    selection_hash = "a" * 64
+    scope_path = tmp_path / "drug_scope.parquet"
+    review_dir = tmp_path / "unit_reviews"
+    review_dir.mkdir()
+    pl.DataFrame({
+        "hcpcs": ["J1234", "J2345"],
+        "billing_qty": [10.0, 5.0],
+        "billing_unit": ["MG", "MG"],
+        "selection_source_sha256": [selection_hash, selection_hash],
+        "reviewed_by": [None, "Old approval"],
+        "review_status": [None, "validated"],
+        "review_date": [None, "old-date"],
+        "review_notes": [None, "old approval note"],
+        "unit_review_file": [None, "old.csv"],
+        "unit_review_sha256": [None, "old-hash"],
+    }).write_parquet(scope_path)
+
+    review_path = review_dir / "app_reviews.csv"
+    with review_path.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=[
+            "HCPCS_Cd", "reviewed_by", "billing_unit", "billing_unit_qty",
+            "selection_source_sha256", "review_status", "review_notes",
+        ])
+        writer.writeheader()
+        writer.writerow({"HCPCS_Cd": "J1234", "reviewed_by": "External Pharmacist",
+                         "billing_unit": "MG", "billing_unit_qty": "10",
+                         "selection_source_sha256": selection_hash, "review_status": "validated",
+                         "review_notes": "Verified against the CMS ASP dosage."})
+        writer.writerow({"HCPCS_Cd": "J2345", "reviewed_by": "External Pharmacist",
+                         "billing_unit": "MG", "billing_unit_qty": "5",
+                         "selection_source_sha256": selection_hash, "review_status": "rejected",
+                         "review_notes": "The unit evidence does not support approval."})
+
+    assert apply_saved_scope_reviews(scope_path, review_dir) == 2
+    output = pl.read_parquet(scope_path).sort("hcpcs").to_dicts()
+    assert output[0]["reviewed_by"] == "External Pharmacist"
+    assert output[0]["review_status"] == "validated"
+    assert output[0]["review_notes"] == "Verified against the CMS ASP dosage."
+    assert len(output[0]["unit_review_sha256"]) == 64
+    assert output[1]["reviewed_by"] is None
+    assert output[1]["review_status"] == "rejected"
+    assert hashlib.sha256(review_path.read_bytes()).hexdigest() == output[1]["unit_review_sha256"]

@@ -129,22 +129,84 @@ def find_spending_table(files: list[Path]):
 
 
 def review_rows(raw_dir: Path, selection_hash: str) -> dict[str, dict]:
-    """Load optional reviewer sign-offs; a sign-off only applies to the exact ASP unit."""
+    """Load unit decisions tied to one exact Part B selection checksum."""
     reviews = {}
     for path in sorted(raw_dir.glob("**/*.csv")):
         digest = sha256(path)
         with path.open(newline="", encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
                 fields = {key(k): v for k, v in row.items()}
-                code = norm_hcpcs(fields.get("hcpcs_cd") or fields.get("hcpcs_code") or fields.get("hcpcs"))
-                reviewer = (fields.get("reviewed_by") or fields.get("reviewer") or "").strip()
-                review_hash = (fields.get("selection_source_sha256") or
-                               fields.get("scope_source_sha256") or "").strip().lower()
-                if code and reviewer and review_hash == selection_hash.lower():
-                    fields["source_file"] = path.relative_to(Path(__file__).resolve().parent.parent).as_posix()
+                code = norm_hcpcs(fields.get("hcpcscd") or fields.get("hcpcscode") or fields.get("hcpcs"))
+                reviewer = (fields.get("reviewedby") or fields.get("reviewer") or "").strip()
+                review_hash = (fields.get("selectionsourcesha256") or
+                               fields.get("scopesourcesha256") or "").strip().lower()
+                decision = (fields.get("reviewstatus") or fields.get("decision") or "").strip().casefold()
+                if (code and reviewer and decision in {"validated", "approved", "rejected", "unit_unresolved"}
+                        and review_hash == selection_hash.lower()):
+                    try:
+                        fields["source_file"] = path.resolve().relative_to(
+                            Path(__file__).resolve().parent.parent).as_posix()
+                    except ValueError:
+                        fields["source_file"] = path.as_posix()
                     fields["source_sha256"] = digest
+                    fields["_review_decision"] = decision
                     reviews[code] = fields
     return reviews
+
+
+def apply_saved_scope_reviews(output: Path, review_dir: Path) -> int:
+    """Apply current review decisions to an archived scope without raw CMS files."""
+    if not output.is_file():
+        return 0
+    scope = pl.read_parquet(output)
+    if scope.is_empty() or "selection_source_sha256" not in scope.columns:
+        return 0
+    selection_hashes = scope["selection_source_sha256"].drop_nulls().unique().to_list()
+    if len(selection_hashes) != 1:
+        raise ValueError("Saved drug scope must contain exactly one Part B source checksum.")
+    selection_hash = str(selection_hashes[0])
+    if not selection_hash:
+        return 0
+    reviews = review_rows(review_dir, selection_hash)
+    if not reviews:
+        return 0
+
+    records = scope.to_dicts()
+    updated = 0
+    for record in records:
+        review = reviews.get(record.get("hcpcs"))
+        if not review:
+            continue
+        review_unit = (review.get("billingunit") or review.get("unit") or "").strip().upper()
+        review_quantity = number(review.get("billingunitqty") or review.get("qty"))
+        scope_quantity = number(record.get("billing_qty"))
+        scope_unit = str(record.get("billing_unit") or "").strip().upper()
+        unit_matches = (review_quantity is not None and scope_quantity is not None
+                        and review_quantity == scope_quantity and review_unit == scope_unit)
+        decision = review["_review_decision"]
+        record["reviewed_by"] = (review.get("reviewedby") or review.get("reviewer")
+                                 if unit_matches and decision in {"validated", "approved"} else None)
+        record["review_status"] = decision if unit_matches else "unit_mismatch"
+        record["review_date"] = (review.get("reviewdate") or review.get("reviewedat")
+                                if unit_matches else None)
+        record["review_notes"] = (review.get("reviewnotes") or review.get("notes")
+                                 if unit_matches else None)
+        record["unit_review_file"] = review.get("source_file")
+        record["unit_review_sha256"] = review.get("source_sha256")
+        updated += 1
+
+    if not updated:
+        return 0
+    temporary = output.with_name(output.name + ".part")
+    try:
+        pl.DataFrame(records, schema=scope.schema, orient="row").write_parquet(
+            temporary, compression="zstd")
+        if pl.scan_parquet(temporary).select(pl.len()).collect().item() != scope.height:
+            raise ValueError("Updated drug scope row count did not match the saved Parquet.")
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return updated
 
 
 def main() -> int:
@@ -164,7 +226,10 @@ def main() -> int:
                           if p.is_file() and p.suffix.casefold() in {".csv", ".zip"}})
     output = locations["ref"] / "drug_scope.parquet"
     if not input_paths and output.is_file():
+        applied_reviews = apply_saved_scope_reviews(output, raw / "unit_reviews")
         print("No new CMS Part B source file; using the saved drug-scope Parquet.")
+        if applied_reviews:
+            print(f"Applied {applied_reviews} scope-bound unit review decision(s) to saved Parquet.")
         return 0
     (_, _, source_path, source_member, spending_rows, columns,
      code_col, spend_year, spend_col) = find_spending_table(input_paths)
@@ -212,20 +277,21 @@ def main() -> int:
         asp = asp_by_code.get(item["hcpcs"], {})
         dose = parse_hcpcs_dosage(asp.get("dosage_text"))
         review = reviews.get(item["hcpcs"], {})
-        review_unit = (review.get("billing_unit") or review.get("unit") or "").strip().upper()
-        try:
-            review_qty = float(review.get("billing_unit_qty") or review.get("qty") or "nan")
-        except ValueError:
-            review_qty = float("nan")
-        reviewer = (review.get("reviewed_by") or review.get("reviewer") or "").strip()
-        reviewed_by = reviewer if dose and review_unit == dose.unit and review_qty == dose.qty else None
+        review_unit = (review.get("billingunit") or review.get("unit") or "").strip().upper()
+        review_qty = number(review.get("billingunitqty") or review.get("qty"))
+        reviewer = (review.get("reviewedby") or review.get("reviewer") or "").strip()
+        unit_matches = bool(dose and review_unit == dose.unit and review_qty == dose.qty)
+        approved = unit_matches and review.get("_review_decision") in {"validated", "approved"}
         out.append({
             **item,
             "effective_start": date(spend_year, 1, 1) if spend_year else None,
             "effective_end": date(spend_year, 12, 31) if spend_year else None,
             "billing_qty": dose.qty if dose else None,
             "billing_unit": dose.unit if dose else None,
-            "reviewed_by": reviewed_by or None,
+            "reviewed_by": reviewer if approved else None,
+            "review_status": review.get("_review_decision") if unit_matches else "unit_mismatch" if review else None,
+            "review_date": (review.get("reviewdate") or review.get("reviewedat")) if review and unit_matches else None,
+            "review_notes": (review.get("reviewnotes") or review.get("notes")) if review and unit_matches else None,
             "spend_rank": rank,
             "spend_year": spend_year or None,
             "asp_quarter": asp.get("quarter"),

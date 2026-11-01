@@ -20,7 +20,7 @@ import DrugScope from "./pages/DrugScope.jsx";
 import UnitValidation from "./pages/UnitValidation.jsx";
 import AuditLogs from "./pages/AuditLogs.jsx";
 import Settings from "./pages/Settings.jsx";
-import PlanAudit from "./pages/PlanAudit.jsx";
+import UserManagement from "./pages/UserManagement.jsx";
 
 function Landing({ onLogin }) {
   const [username, setUsername] = useState("");
@@ -107,7 +107,7 @@ function Landing({ onLogin }) {
           <p>Sign in to view hospital reports and price comparisons.</p>
         </div>}
         {otpChallenge && <h2>{otpEnrollment ? "Set up Google Authenticator" : "Verify your sign-in"}</h2>}
-        {otpEnrollment && <p className="muted">Authenticator setup is required for every account. Scan the code, then enter the current six-digit code.</p>}
+        {otpEnrollment && <p className="muted">Authenticator setup is required for Admin accounts. Scan the code, then enter the current six-digit code.</p>}
         {otpChallenge && !otpEnrollment && <p className="muted">Enter the current six-digit code from your authenticator app.</p>}
         {!otpChallenge && <>
           <label>Username<input autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} required /></label>
@@ -135,7 +135,7 @@ function Landing({ onLogin }) {
           <span>{error}</span>{lockoutSeconds > 0 && <strong>Retry in {Math.floor(lockoutSeconds / 60)}:{String(lockoutSeconds % 60).padStart(2, "0")}</strong>}
         </div>}
         <button disabled={busy || lockoutSeconds > 0 || (otpChallenge && otpCode.length !== 6 && !recoveryCode)}>{busy ? "Signing in…" : otpEnrollment ? "Enable authenticator and continue" : otpChallenge ? "Verify code" : lockoutSeconds ? "Please wait" : "Sign in"}</button>
-        {!otpChallenge && !firstLoginCodes.length && <p className="login-security-note"><span aria-hidden="true">●</span> Protected with Google Authenticator</p>}
+        {!otpChallenge && !firstLoginCodes.length && <p className="login-security-note"><span aria-hidden="true">●</span> Admin accounts use Google Authenticator verification</p>}
         </>}
       </form>
     </main>
@@ -147,12 +147,16 @@ function LegacyDrugRedirect() {
   return <Navigate to={`/medicare-part-b-drugs/${encodeURIComponent(hcpcs)}`} replace />;
 }
 
+function AdminOnly({ user, children }) {
+  return user?.roles?.includes("Admin") ? children : <Navigate to="/" replace />;
+}
+
 function Shell({ user, onLogout }) {
   const [collapsed, setCollapsed] = useState(false);
   const [search, setSearch] = useState("");
   const location = useLocation();
   const navigate = useNavigate();
-  const titles = { "/": "Overview", "/reference-data-sets": "Reference data", "/hospital-price-transparency-files": "Hospital price files", "/hospitals": "Hospitals", "/drug-selection-scope": "Drug selection scope", "/drug-unit-validations": "Drug unit validations", "/hospital-drug-price-comparisons": "Hospital drug price comparisons", "/data-sources": "Data sources", "/reports": "Reports & exports", "/audit-logs": "Audit logs", "/application-settings": "Application settings", "/plan-specific-audit": "Plan-specific audit", "/hospital-file-quality": "Hospital file quality", "/methodology": "Methodology" };
+  const titles = { "/": "Overview", "/reference-data-sets": "Reference data", "/hospital-price-transparency-files": "Hospital price files", "/hospitals": "Hospitals", "/drug-selection-scope": "Drug selection scope", "/drug-unit-validations": "Drug unit validations", "/hospital-drug-price-comparisons": "Hospital drug price comparisons", "/data-sources": "Data sources", "/reports": "Reports & exports", "/audit-logs": "Audit logs", "/application-settings": "Application settings", "/hospital-file-quality": "Hospital file quality", "/methodology": "Methodology", "/user-management": "User management" };
   const pageTitle = titles[location.pathname] || "Infusion Drug Markup Audit";
   function submitSearch(event) {
     event.preventDefault();
@@ -165,21 +169,22 @@ function Shell({ user, onLogout }) {
         <div className="sidebar-group"><span className="sidebar-label">AUDIT PLATFORM</span><nav aria-label="Main navigation">
           <NavLink to="/" end><span>◫</span>{!collapsed && "Overview"}</NavLink>
           <NavLink to="/hospitals"><span>⌂</span>{!collapsed && "Hospitals"}</NavLink>
-          <NavLink to="/drug-selection-scope"><span>#</span>{!collapsed && "Drug Scope"}</NavLink>
+          {user.roles?.includes("Admin") && <NavLink to="/drug-selection-scope"><span>#</span>{!collapsed && "Drug Scope"}</NavLink>}
           <NavLink to="/hospital-drug-price-comparisons"><span>↗</span>{!collapsed && "Comparisons"}</NavLink>
           <NavLink to="/reports"><span>▧</span>{!collapsed && "Reports"}</NavLink>
           <details className="sidebar-more">
             <summary><span>•••</span>{!collapsed && "More"}</summary>
             <div className="sidebar-subnav">
-              <NavLink to="/hospital-price-transparency-files">Hospital Price Files</NavLink>
-              <NavLink to="/reference-data-sets">Reference Data Sets</NavLink>
-              <NavLink to="/hospital-file-quality">Hospital File Quality</NavLink>
               <NavLink to="/methodology">Methodology</NavLink>
               {user.roles?.includes("Admin") && <>
+                <NavLink to="/hospital-price-transparency-files">Hospital Price Files</NavLink>
+                <NavLink to="/reference-data-sets">Reference Data Sets</NavLink>
+                <NavLink to="/hospital-file-quality">Hospital File Quality</NavLink>
                 <NavLink to="/data-sources">Data Sources & Import</NavLink>
                 <NavLink to="/drug-unit-validations">Drug Unit Review</NavLink>
+                <NavLink to="/audit-logs">Audit Logs</NavLink>
+                <NavLink to="/user-management">User Management</NavLink>
               </>}
-              {user.roles?.includes("Admin") && <NavLink to="/audit-logs">Audit Logs</NavLink>}
               <NavLink to="/application-settings">Application Settings</NavLink>
             </div>
           </details>
@@ -194,21 +199,21 @@ function Shell({ user, onLogout }) {
       </header>
       <main className="page-content">
         <Routes>
-          <Route path="/" element={<Overview />} />
-          <Route path="/reference-data-sets" element={<ReferenceData />} />
-          <Route path="/hospital-price-transparency-files" element={<HospitalFiles />} />
-          <Route path="/medicare-part-b-drugs/:hcpcs" element={<DrugDetail />} />
-          <Route path="/hospitals" element={<Hospitals />} />
-          <Route path="/hospitals/:key" element={<HospitalDetail />} />
-          <Route path="/drug-selection-scope" element={<DrugScope />} />
-          <Route path="/drug-unit-validations" element={<UnitValidation user={user} />} />
-          <Route path="/hospital-drug-price-comparisons" element={<Rates />} />
-          <Route path="/hospital-file-quality" element={<Quality />} />
-          <Route path="/data-sources" element={<Sources user={user} />} />
+          <Route path="/" element={<Overview user={user} />} />
+          <Route path="/reference-data-sets" element={<AdminOnly user={user}><ReferenceData /></AdminOnly>} />
+          <Route path="/hospital-price-transparency-files" element={<AdminOnly user={user}><HospitalFiles /></AdminOnly>} />
+          <Route path="/medicare-part-b-drugs/:hcpcs" element={<DrugDetail user={user} />} />
+          <Route path="/hospitals" element={<Hospitals user={user} />} />
+          <Route path="/hospitals/:key" element={<HospitalDetail user={user} />} />
+          <Route path="/drug-selection-scope" element={<AdminOnly user={user}><DrugScope user={user} /></AdminOnly>} />
+          <Route path="/drug-unit-validations" element={<AdminOnly user={user}><UnitValidation user={user} /></AdminOnly>} />
+          <Route path="/hospital-drug-price-comparisons" element={<Rates user={user} />} />
+          <Route path="/hospital-file-quality" element={<AdminOnly user={user}><Quality /></AdminOnly>} />
+          <Route path="/data-sources" element={<AdminOnly user={user}><Sources user={user} /></AdminOnly>} />
           <Route path="/reports" element={<Reports user={user} />} />
-          <Route path="/audit-logs" element={<AuditLogs />} />
+          <Route path="/audit-logs" element={<AdminOnly user={user}><AuditLogs /></AdminOnly>} />
+          <Route path="/user-management" element={<AdminOnly user={user}><UserManagement user={user} /></AdminOnly>} />
           <Route path="/application-settings" element={<Settings user={user} />} />
-          <Route path="/plan-specific-audit" element={<PlanAudit />} />
           <Route path="/methodology" element={<Method />} />
           <Route path="/reference" element={<Navigate to="/reference-data-sets" replace />} />
           <Route path="/hospital-files" element={<Navigate to="/hospital-price-transparency-files" replace />} />
@@ -219,7 +224,7 @@ function Shell({ user, onLogout }) {
           <Route path="/quality" element={<Navigate to="/hospital-file-quality" replace />} />
           <Route path="/sources" element={<Navigate to="/data-sources" replace />} />
           <Route path="/settings" element={<Navigate to="/application-settings" replace />} />
-          <Route path="/plan-audit" element={<Navigate to="/plan-specific-audit" replace />} />
+          <Route path="/plan-audit" element={<Navigate to="/methodology" replace />} />
           <Route path="/method" element={<Navigate to="/methodology" replace />} />
           <Route path="/dashboard/*" element={<Navigate to="/" replace />} />
         </Routes>

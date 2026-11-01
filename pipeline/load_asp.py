@@ -93,7 +93,7 @@ def _best_table(zip_path: Path, must) -> tuple[str, list[str], list[list[str]]]:
 
 # ---------- loaders ----------
 
-def load_payment_limit(zip_path: Path, quarter: str) -> pl.DataFrame:
+def load_payment_limit(zip_path: Path, quarter: str) -> tuple[pl.DataFrame, pl.DataFrame]:
     member, header, rows = _best_table(
         zip_path, [_is_hcpcs_col, lambda k: k == "paymentlimit"])
     i_code = _pick(header, _is_hcpcs_col)
@@ -129,13 +129,26 @@ def load_payment_limit(zip_path: Path, quarter: str) -> pl.DataFrame:
             "source_sha256": digest,
         })
     df = pl.DataFrame(out)
+    active, excluded = _split_unpriced_asp(df, zip_path.name)
+    print(f"  ASP {quarter}: {len(active):,} priced codes "
+          f"({len(excluded)} rows without a published payment limit excluded, "
+          f"{bad_codes} non-code rows skipped) from {member}")
+    return active, excluded
+
+
+def _split_unpriced_asp(df: pl.DataFrame, source: str
+                        ) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Exclude missing CMS limits from comparisons without losing their source rows."""
+    if df.is_empty():
+        raise ValueError(f"{source}: no ASP rows were found")
     nulls = df["payment_limit"].null_count()
     if len(df) == 0 or nulls / len(df) > 0.01:
-        raise ValueError(f"{zip_path.name}: {nulls} of {len(df)} payment limits are null "
-                         f"(over 1%). Check the column mapping.")
-    print(f"  ASP {quarter}: {len(df):,} codes ({nulls} null limits, "
-          f"{bad_codes} non-code rows skipped) from {member}")
-    return df
+        raise ValueError(f"{source}: {nulls} of {len(df)} payment limits are null "
+                         f"(over 1%). Check the source file and column mapping.")
+    excluded = (df.filter(pl.col("payment_limit").is_null())
+                .with_columns(pl.lit("missing_payment_limit").alias("exclusion_reason")))
+    active = df.filter(pl.col("payment_limit").is_not_null())
+    return active, excluded
 
 
 def load_crosswalk(zip_path: Path, quarter: str) -> pl.DataFrame:
@@ -216,6 +229,56 @@ def _revision_key(path: Path) -> tuple:
             path.stat().st_mtime_ns, path.name.casefold())
 
 
+def _merge_unpriced(frames: list[pl.DataFrame], replaced_quarters: list[str]
+                    ) -> pl.DataFrame:
+    """Combine exclusions while dropping stale exceptions for replaced quarters."""
+    kept = []
+    empty_template = None
+    for frame in frames:
+        if "exclusion_reason" not in frame.columns:
+            frame = frame.with_columns(
+                pl.lit("missing_payment_limit").alias("exclusion_reason"))
+        if empty_template is None:
+            empty_template = frame.head(0)
+        if frame.is_empty():
+            continue
+        if replaced_quarters:
+            frame = frame.filter(~pl.col("quarter").is_in(replaced_quarters))
+        if not frame.is_empty():
+            kept.append(frame)
+    if not kept:
+        return empty_template if empty_template is not None else pl.DataFrame()
+    return pl.concat(kept, how="diagonal_relaxed").unique(maintain_order=True)
+
+
+def _commit_parquets(outputs: list[tuple[Path, Path]]) -> None:
+    """Replace a related set of Parquet files with rollback if any replace fails."""
+    backups: dict[Path, Path] = {}
+    existed = {target: target.exists() for _, target in outputs}
+    try:
+        for _, target in outputs:
+            if target.exists():
+                backup = target.with_name(target.name + ".bak")
+                import shutil
+                shutil.copy2(target, backup)
+                backups[target] = backup
+        try:
+            for tmp, target in outputs:
+                os.replace(tmp, target)
+        except Exception:
+            for _, target in outputs:
+                if target in backups:
+                    os.replace(backups[target], target)
+                elif not existed[target]:
+                    target.unlink(missing_ok=True)
+            raise
+    finally:
+        for tmp, _ in outputs:
+            tmp.unlink(missing_ok=True)
+        for backup in backups.values():
+            backup.unlink(missing_ok=True)
+
+
 def main() -> int:
     p = paths()
     raw = p["raw"]
@@ -237,59 +300,92 @@ def main() -> int:
 
     if not chosen:
         asp_snapshot = p["ref"] / "ref_asp.parquet"
-        crosswalk_snapshot = p["ref"] / "ref_crosswalk.parquet"
         if asp_snapshot.is_file():
+            snapshot = pl.read_parquet(asp_snapshot)
+            active, newly_excluded = _split_unpriced_asp(snapshot, asp_snapshot.name)
+            excluded_path = p["ref"] / "ref_asp_excluded.parquet"
+            old_excluded = ([pl.read_parquet(excluded_path)]
+                            if excluded_path.is_file() else [])
+            all_excluded = _merge_unpriced(
+                [*old_excluded, newly_excluded], replaced_quarters=[])
+            if len(newly_excluded):
+                p["ref"].mkdir(parents=True, exist_ok=True)
+                active_tmp = asp_snapshot.with_name(asp_snapshot.name + ".part")
+                active.write_parquet(active_tmp, compression="zstd")
+                outputs = [(active_tmp, asp_snapshot)]
+                if len(all_excluded) or excluded_path.exists():
+                    excluded_tmp = excluded_path.with_name(excluded_path.name + ".part")
+                    all_excluded.write_parquet(excluded_tmp, compression="zstd")
+                    outputs.append((excluded_tmp, excluded_path))
+                _commit_parquets(outputs)
+                print(f"Removed {len(newly_excluded)} unpriced rows from ref_asp.parquet; "
+                      f"preserved them in {excluded_path.name}.")
             print("No new ASP/crosswalk source files; using the saved Parquet snapshots.")
             return 0
         print("No ASP or crosswalk ZIPs found under", raw)
         return 1
 
-    asp = [load_payment_limit(z, q) for (k, q), z in sorted(chosen.items()) if k == "asp"]
+    asp_results = [load_payment_limit(z, q) for (k, q), z in sorted(chosen.items())
+                   if k == "asp"]
+    asp = [active for active, _ in asp_results]
+    asp_excluded = [excluded for _, excluded in asp_results]
     xw = [load_crosswalk(z, q) for (k, q), z in sorted(chosen.items()) if k == "crosswalk"]
 
     p["ref"].mkdir(parents=True, exist_ok=True)
     outputs = []
-    for frames, filename in ((asp, "ref_asp.parquet"), (xw, "ref_crosswalk.parquet")):
+    asp_target = p["ref"] / "ref_asp.parquet"
+    excluded_target = p["ref"] / "ref_asp_excluded.parquet"
+    if asp or asp_target.is_file():
+        replaced_quarters = (pl.concat(asp, how="vertical_relaxed")["quarter"].unique().to_list()
+                             if asp else [])
+        prior_exclusions = ([pl.read_parquet(excluded_target)]
+                            if excluded_target.is_file() else [])
+        if asp_target.is_file():
+            prior_active = pl.read_parquet(asp_target)
+            prior_active, legacy_exclusions = _split_unpriced_asp(
+                prior_active, asp_target.name)
+            prior_exclusions.append(legacy_exclusions)
+            if replaced_quarters:
+                prior_active = prior_active.filter(
+                    ~pl.col("quarter").is_in(replaced_quarters))
+        else:
+            prior_active = None
+
+        active_frames = ([prior_active] if prior_active is not None else []) + asp
+        if active_frames:
+            combined_active = pl.concat(active_frames, how="vertical_relaxed").sort("quarter")
+            if combined_active.is_empty():
+                raise ValueError("Refusing to replace ref_asp.parquet with an empty dataset")
+            asp_tmp = asp_target.with_name(asp_target.name + ".part")
+            combined_active.write_parquet(asp_tmp, compression="zstd")
+            outputs.append((asp_tmp, asp_target))
+
+        all_excluded = _merge_unpriced(
+            [*prior_exclusions, *asp_excluded], replaced_quarters=replaced_quarters)
+        if len(all_excluded) or excluded_target.exists():
+            excluded_tmp = excluded_target.with_name(excluded_target.name + ".part")
+            all_excluded.write_parquet(excluded_tmp, compression="zstd")
+            outputs.append((excluded_tmp, excluded_target))
+
+    for frames, filename in ((xw, "ref_crosswalk.parquet"),):
         if not frames:
             continue
         target = p["ref"] / filename
         tmp = target.with_name(target.name + ".part")
         incoming = pl.concat(frames, how="vertical_relaxed")
         if target.is_file():
-            existing = pl.read_parquet(target)
+            existing_xw = pl.read_parquet(target)
             incoming_quarters = incoming["quarter"].unique().to_list()
-            existing = existing.filter(~pl.col("quarter").is_in(incoming_quarters))
-            incoming = pl.concat([existing, incoming], how="vertical_relaxed").sort("quarter")
+            existing_xw = existing_xw.filter(~pl.col("quarter").is_in(incoming_quarters))
+            incoming = pl.concat([existing_xw, incoming], how="vertical_relaxed").sort("quarter")
         incoming.write_parquet(tmp, compression="zstd")
         count = pl.scan_parquet(tmp).select(pl.len()).collect().item()
         if count <= 0:
             tmp.unlink(missing_ok=True)
             raise ValueError(f"Refusing to replace {filename} with an empty dataset")
         outputs.append((tmp, target))
-    backups = {}
-    existing = {target: target.exists() for _, target in outputs}
-    try:
-        for _, target in outputs:
-            if target.exists():
-                backup = target.with_name(target.name + ".bak")
-                import shutil
-                shutil.copy2(target, backup)
-                backups[target] = backup
-        try:
-            for tmp, target in outputs:
-                os.replace(tmp, target)
-        except Exception:
-            for _, target in outputs:
-                if target in backups:
-                    os.replace(backups[target], target)
-                elif not existing[target]:
-                    target.unlink(missing_ok=True)
-            raise
-    finally:
-        for tmp, _ in outputs:
-            tmp.unlink(missing_ok=True)
-        for backup in backups.values():
-            backup.unlink(missing_ok=True)
+    if outputs:
+        _commit_parquets(outputs)
     print(f"Wrote {len(asp)} ASP quarters and {len(xw)} crosswalk quarters to {rel(p['ref'])}")
     return 0
 

@@ -1,52 +1,68 @@
-# Storage and data provenance
+# Data storage and provenance
 
 ## Storage boundary
 
-PostgreSQL stores operational application records. Large analytic tables remain
-in Parquet and are queried through DuckDB. Imported Parquet is the durable
-analytics store; source uploads are used during ingestion and retained for
-lineage, but dashboard and comparison reads do not require them. The dashboard's
-Reference Data page exposes only a fixed allow-list of Parquet tables and safe
-filters; it does not let ordinary users run SQL.
+Parquet is the durable store for analytical data. DuckDB reads the curated
+Parquet files for dashboard queries and report generation. The local SQLite
+database contains user and operational records only; it does not store hospital
+rate rows. PostgreSQL is not required by the application.
 
-## PostgreSQL models
+Original downloads are pipeline ingestion inputs. The dashboard and comparison
+queries continue to work from a verified saved Parquet snapshot if raw files
+are unavailable. Each analytical artifact retains source file/checksum
+lineage where applicable, and run metadata binds the selected drug scope to its
+CMS Part B source checksum.
 
-| Model | Main fields and relationships | Source of truth |
+## SQLite operational tables
+
+| Model | Stored information | Source of truth |
 |---|---|---|
-| Django User and Group | Username, password hash, active/staff flags; exactly Admin or Viewer application role | Local Root Admin provisioning and managed user accounts |
-| `SourceFile` | Source key, original name, relative path, format, source URL, SHA-256, size, reporting period, status/error | Uploaded files and generated inventory; `converted` means the checksum appears in a Parquet artifact |
-| `ProcessingJob` | Type, status, progress, timestamps, summary/error, requesting user | API requests and background worker |
-| `ReportRecord` | Type, status, output path, source/config hashes, metadata, approver and time | Report generation and sign-off |
-| `DrugUnitReview` | HCPCS, selected-scope hash, decimal billing quantity/unit, decision, reviewer, notes | Admin review tied to the exact scope hash |
-| `AdminOTPDevice` | User, Fernet-encrypted TOTP seed, enabled flag, replay step, one-time recovery-code hashes | Admin enrollment; encryption key is supplied by `TOTP_ENCRYPTION_KEY` |
-| `AuditEvent` | Optional actor, action, entity, JSON details, timestamp | Authentication, review, import, and report actions |
+| Django `User` and `Group` | Username, password hash, active flag, and Admin or Viewer application role | Account provisioning and Admin user management |
+| `SourceFile` | Upload name/path, source key, format, checksum, size, and import status | Admin source upload and pipeline conversion |
+| `ProcessingJob` | Job type, progress, status, requesting user, timestamps, summary, and error | Admin import/report actions |
+| `ReportRecord` | Report status, comparison/config checksums, builder, approver, and release metadata | Report build and independent Admin release |
+| `DrugUnitReview` | HCPCS, selected-scope checksum, reviewed unit, external clinical reviewer, decision, notes, and Admin recorder | Admin review tied to the current selected scope |
+| `AdminOTPDevice` | Encrypted TOTP seed, enabled state, replay-prevention step, and hashed recovery codes | Admin Google Authenticator enrollment |
+| `AuditEvent` | Actor, action, entity, safe metadata, and timestamp | Sign-in, data access, import, review, account, and release events |
 
-Foreign keys preserve actor/requester/reviewer/approver attribution while allowing
-account deletion to retain historical events with a null actor where configured.
-OTP secrets are encrypted at rest; recovery codes are one-way password hashes.
-Keep `TOTP_ENCRYPTION_KEY` stable and backed up. Losing it makes enrolled seeds
-unreadable.
+Passwords use Django's password hashers. Authenticator seeds are encrypted at
+rest with `TOTP_ENCRYPTION_KEY`; recovery codes are one-way hashes. Keep the
+encryption key stable and backed up. The database path defaults to
+`data/operational/meshkor.sqlite3` and can be changed with
+`OPERATIONAL_DB_PATH`.
 
-## Parquet datasets
+## Parquet artifacts
 
-The API and comparison builder resolve canonical artifact paths from
-`pipeline.common.paths()` and `pricing.data.files()`. New uploads are converted
-during import. Later dashboard reads and comparison rebuilds use these Parquet
-snapshots even when the original source file is unavailable. The principal
-analytical artifacts are:
-
-| Artifact | Contents |
+| Path | Contents |
 |---|---|
-| `data/ref/ref_asp.parquet` | CMS ASP payment limits by HCPCS and quarter, including dosage/source metadata |
-| `data/ref/ref_crosswalk.parquet` | CMS NDC-to-HCPCS mapping |
-| `data/ref/drug_scope.parquet` | HCPCS scope selected from CMS Part B drug spending, with source checksum and billing-unit review fields |
-| `data/hpt/norm/hpt_drug_rates.parquet` | Normalized hospital-file drug rates and source lineage |
-| `data/hpt/norm/hpt_file_quality.parquet` | Per-file parse result, scanned item count, normalized row count, and errors |
-| `data/mart/comparison.parquet` | Comparison observations with status, unit, ASP quarter, source hashes, and methodology fields |
-| `data/mart/run_info.json` | Pipeline timestamp, source checksum, selected codes, quarter coverage, row count, and calculation version |
+| `data/ref/ref_asp.parquet` | CMS ASP payment limits by HCPCS and quarter, dosage, and source lineage |
+| `data/ref/ref_crosswalk.parquet` | CMS NDC-to-HCPCS crosswalk |
+| `data/ref/ref_ndc_products.parquet` and `ref_ndc_packages.parquet` | FDA NDC product and package references |
+| `data/ref/ref_hospitals.parquet` | CMS hospital catalog |
+| `data/ref/ref_nadac.parquet` | NADAC acquisition-cost reference; not payer reimbursement |
+| `data/ref/ref_providers.parquet` and `ref_enrollments.parquet` | Provider identity and CMS enrollment references |
+| `data/ref/drug_scope.parquet` | Part B spend-ranked HCPCS scope and selection-source checksum |
+| `data/hpt/norm/hpt_drug_rates.parquet` | Normalized hospital machine-readable-file rates and lineage |
+| `data/hpt/norm/hpt_file_quality.parquet` | File parsing results, row counts, and errors |
+| `data/mart/comparison.parquet` | Hospital rate observations, billing units, ASP benchmark, comparison status, and source checksums |
+| `data/mart/run_info.json` | Run timestamp, drug scope, source checksum, calculation settings, and comparison row count |
 
-The comparison output has one row per qualifying hospital rate/price type. Rows
-with missing benchmarks or unresolved units remain explicitly classified rather
-than being converted into zero excess. Any saved Parquet snapshot without its
-original source file is labeled as an archived snapshot by the API.
+The CMS ASP payment limit already includes the statutory 6% add-on. The
+comparison does not add the 6% again. Units that cannot be verified remain
+unpriced with an explicit status. Percentage-of-charge rows are not converted
+to dollar amounts.
 
+## Access boundaries
+
+- Admin can manage sources, jobs, reviews, accounts, quality information, and
+  report release.
+- Viewer can access only a current released report and the corresponding
+  filtered comparisons. Viewer responses omit internal source paths, failed
+  rows, unresolved-unit work queues, and operational audit data.
+- A report requires every selected drug to have an external clinical unit
+  review, an Admin other than its builder to release it, and at least two active
+  Admin accounts.
+
+The current dataset may still have visible coverage gaps. Hospital price files
+do not establish complete Ohio hospital coverage, and missing payer files or
+client claims cannot be inferred from hospital data.

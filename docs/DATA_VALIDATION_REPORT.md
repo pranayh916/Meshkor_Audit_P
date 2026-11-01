@@ -1,6 +1,6 @@
 # Data validation report
 
-**Audit date:** 2026-10-31
+**Audit date:** 2026-11-01
 
 ## Pipeline and Parquet
 
@@ -22,7 +22,7 @@
   crosswalk: 81,390 rows. CMS Ohio hospital catalog: 123 rows. Saved drug
   scope: 20 codes, year 2024, checksum-verified snapshot; raw CMS Part B source
   unavailable.
-- `validate_parquet` inspected 623 Parquet files and passed readability and
+- `validate_parquet` inspected 624 Parquet files and passed readability and
   comparison/run-metadata checks. This validates file integrity/count
   consistency; it is not a complete semantic validation of every CMS field.
 

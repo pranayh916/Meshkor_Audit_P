@@ -1,14 +1,31 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { fmt, useApi } from "../api.js";
-import { Loading, MarkupBars } from "../components.jsx";
+import { Loading, MarkupBars, Table } from "../components.jsx";
 
-export default function Overview() {
+export default function Overview({ user }) {
+  const isAdmin = user?.roles?.includes("Admin");
   const meta = useApi("dashboard/summary");
   const drugs = useApi("medicare-part-b-drugs");
   const [search, setSearch] = useState("");
   const [sortKey, setSortKey] = useState("median_markup");
   const [sortDir, setSortDir] = useState("desc");
+
+  if (!isAdmin && meta.error?.status === 403) {
+    return <div className="overview-page">
+      <header className="overview-header">
+        <div className="header-titles">
+          <p className="eyebrow">Viewer workspace</p>
+          <h1 className="header-main-title">You are signed in</h1>
+          <p className="header-subtitle">There is no released report available for Viewer access yet.</p>
+        </div>
+      </header>
+      <section className="note" role="status">
+        <h2>Report release is pending</h2>
+        <p>Your Viewer account and password were accepted. An Admin must finish the external clinical unit reviews and have a different Admin release the current report before Viewer dashboards and comparisons become available.</p>
+      </section>
+    </div>;
+  }
 
   const drugRows = drugs.data || [];
   const m = meta.data || {};
@@ -56,10 +73,12 @@ export default function Overview() {
           ========================================================================= */}
       <header className="overview-header">
         <div className="header-titles">
-          <p className="eyebrow">MeshKor Healthcare</p>
-          <h1 className="header-main-title">Infusion Drug Markup Audit</h1>
+          <p className="eyebrow">{isAdmin ? "Admin workspace" : "Viewer workspace"}</p>
+          <h1 className="header-main-title">{isAdmin ? "Audit Operations Dashboard" : "Hospital Pricing Insights"}</h1>
           <p className="header-subtitle">
-            Ohio Hospital Pricing vs Medicare Part B Benchmark
+            {isAdmin
+              ? "Monitor imports, data quality, and Ohio hospital pricing against Medicare Part B."
+              : "Explore read-only Ohio hospital pricing comparisons against Medicare Part B benchmarks."}
           </p>
         </div>
         <div className="header-metadata">
@@ -82,7 +101,30 @@ export default function Overview() {
         </div>
       </header>
 
-      {m.data_is_archived_snapshot && <div className="snapshot-notice" role="status">
+      <section className={`role-dashboard role-dashboard--${isAdmin ? "admin" : "viewer"}`} aria-label={`${isAdmin ? "Admin" : "Viewer"} dashboard actions`}>
+        <div className="role-dashboard-copy">
+          <span className="role-dashboard-label">{isAdmin ? "Operations and oversight" : "Read-only access"}</span>
+          <h2>{isAdmin ? "Keep the audit data review-ready" : "Explore the available market evidence"}</h2>
+          <p>{isAdmin
+            ? "Manage source imports, resolve unit reviews, and inspect the audit trail."
+            : "Browse hospitals, compare reported prices, and review the benchmark methodology."}</p>
+        </div>
+        <nav className="role-dashboard-links" aria-label="Dashboard shortcuts">
+          {isAdmin ? <>
+            <Link to="/data-sources">Manage imports</Link>
+            <Link to="/drug-unit-validations">Review drug units</Link>
+            <Link to="/hospital-file-quality">File quality</Link>
+            <Link to="/audit-logs">Audit logs</Link>
+          </> : <>
+            <Link to="/hospital-drug-price-comparisons">Explore comparisons</Link>
+            <Link to="/hospitals">Browse hospitals</Link>
+            <Link to="/reports">View reports</Link>
+            <Link to="/methodology">Methodology</Link>
+          </>}
+        </nav>
+      </section>
+
+      {isAdmin && m.data_is_archived_snapshot && <div className="snapshot-notice" role="status">
         This dashboard is using the saved Parquet snapshot. Its original CMS source ZIP is not available here, so the snapshot is shown as archived until sources are uploaded and imported again.
       </div>}
 
@@ -96,54 +138,58 @@ export default function Overview() {
           const reviewNeeded = summary.comparisons_requiring_review;
 
           return (
-            <section className="kpi-grid" aria-label="Executive KPI Summary">
-              {/* Card 1: MRF files in the stored data */}
-              <article className="kpi-card">
-                <span className="kpi-label">Hospital MRF Files</span>
-                <strong className="kpi-value">{fmt.n(summary.hospital_file_count)}</strong>
-                <small className="kpi-definition">
-                  Files catalogued in the stored hospital data
-                </small>
-                <div className="kpi-subtext">
-                  {fmt.n(summary.hospital_files_with_drug_rows)} with selected-drug rows · {fmt.n(summary.hospital_files_with_errors)} parse errors
-                </div>
-              </article>
-
-              {/* Card 2: Valid Price Comparisons */}
-              <article className="kpi-card highlight">
-                <span className="kpi-label">Valid Price Comparisons</span>
-                <strong className="kpi-value">{fmt.n(validRates)}</strong>
-                <small className="kpi-definition">
-                  Eligible hospital rates passed unit & ASP matching
-                </small>
-                <div className="kpi-subtext">
-                  Negotiated dollar rates (`status = ok`)
-                </div>
-              </article>
-
-              {/* Card 3: Drugs Compared */}
-              <article className="kpi-card">
-                <span className="kpi-label">Drugs Compared</span>
-                <strong className="kpi-value">{drugsCompared}</strong>
-                <small className="kpi-definition">
-                  In-scope drugs with &ge;1 valid hospital comparison
-                </small>
-                <div className="kpi-subtext">
-                  Ranked by CMS Part B spending
-                </div>
-              </article>
-
-              {/* Card 4: Comparisons Requiring Review */}
-              <article className="kpi-card warning">
-                <span className="kpi-label">Comparisons Requiring Review</span>
-                <strong className="kpi-value">{fmt.n(reviewNeeded)}</strong>
-                <small className="kpi-definition">
-                  Unresolved units, formulas, or outlier review flags
-                </small>
-                <div className="kpi-subtext">
-                  Excluded from median calculations
-                </div>
-              </article>
+            <section className="kpi-grid" aria-label={isAdmin ? "Admin operations summary" : "Market comparison summary"}>
+              {isAdmin ? <>
+                <article className="kpi-card">
+                  <span className="kpi-label">Hospital MRF Files</span>
+                  <strong className="kpi-value">{fmt.n(summary.hospital_file_count)}</strong>
+                  <small className="kpi-definition">Files catalogued from the stored hospital data</small>
+                  <div className="kpi-subtext">{fmt.n(summary.hospital_files_with_drug_rows)} contain selected-drug rows</div>
+                </article>
+                <article className="kpi-card warning">
+                  <span className="kpi-label">Files with Parse Errors</span>
+                  <strong className="kpi-value">{fmt.n(summary.hospital_files_with_errors)}</strong>
+                  <small className="kpi-definition">Hospital price files with a recorded parser error</small>
+                  <div className="kpi-subtext"><Link to="/hospital-file-quality">Open file quality</Link></div>
+                </article>
+                <article className="kpi-card warning">
+                  <span className="kpi-label">Comparisons Requiring Review</span>
+                  <strong className="kpi-value">{fmt.n(reviewNeeded)}</strong>
+                  <small className="kpi-definition">Unresolved units, formulas, or configured outlier flags</small>
+                  <div className="kpi-subtext"><Link to="/drug-unit-validations">Review flagged records</Link></div>
+                </article>
+                <article className="kpi-card highlight">
+                  <span className="kpi-label">Validated Price Comparisons</span>
+                  <strong className="kpi-value">{fmt.n(summary.validated_comparison_rates)}</strong>
+                  <small className="kpi-definition">Eligible rates with a recorded unit review</small>
+                  <div className="kpi-subtext">Of {fmt.n(validRates)} eligible rates</div>
+                </article>
+              </> : <>
+                <article className="kpi-card highlight">
+                  <span className="kpi-label">Hospitals with Valid Rates</span>
+                  <strong className="kpi-value">{fmt.n(summary.hospitals_with_valid_rates ?? summary.hospitals_covered)}</strong>
+                  <small className="kpi-definition">Hospitals with at least one eligible comparison</small>
+                  <div className="kpi-subtext">Across {fmt.n(summary.systems)} hospital systems</div>
+                </article>
+                <article className="kpi-card">
+                  <span className="kpi-label">Drugs Compared</span>
+                  <strong className="kpi-value">{fmt.n(drugsCompared)}</strong>
+                  <small className="kpi-definition">In-scope drugs with valid hospital pricing evidence</small>
+                  <div className="kpi-subtext">Selected from CMS Part B spending data</div>
+                </article>
+                <article className="kpi-card highlight">
+                  <span className="kpi-label">Valid Price Comparisons</span>
+                  <strong className="kpi-value">{fmt.n(validRates)}</strong>
+                  <small className="kpi-definition">Eligible reported rates matched to an ASP benchmark</small>
+                  <div className="kpi-subtext">Price per HCPCS billing unit</div>
+                </article>
+                <article className="kpi-card">
+                  <span className="kpi-label">Benchmark Quarter</span>
+                  <strong className="kpi-value kpi-value--text">{summary.benchmark_quarters_used || summary.latest_asp_quarter || "—"}</strong>
+                  <small className="kpi-definition">CMS ASP period used by eligible comparisons</small>
+                  <div className="kpi-subtext">Reporting period: {summary.reporting_period || "Unavailable"}</div>
+                </article>
+              </>}
             </section>
           );
         }}
@@ -152,7 +198,7 @@ export default function Overview() {
       {/* =========================================================================
           SECTION 6: Conditional Data-Quality Warning
           ========================================================================= */}
-      {m.comparisons_requiring_review > 0 && (
+      {isAdmin && m.comparisons_requiring_review > 0 && (
         <div className="data-quality-alert" role="alert">
           <div className="alert-icon">⚠</div>
           <div className="alert-content">
@@ -163,11 +209,11 @@ export default function Overview() {
               {fmt.n(m.review_breakdown?.unresolved_units)} rates have unresolved hospital dosage units, {fmt.n(m.review_breakdown?.outliers_review_range)} fall outside the configured {reviewRange[0] ?? "—"}×–{reviewRange[1] ?? "—"}× review range, and {fmt.n(m.review_breakdown?.algorithm_or_percent_charges)} use percentage-of-charge or formula terms. {fmt.n(missingAspRows)} rows lack an exact-quarter ASP benchmark. Rows without a usable unit or exact-quarter ASP benchmark are not priced.
             </div>
             <div className="alert-links">
-              <Link to="/drug-unit-validations" className="alert-link">
+              {isAdmin && <Link to="/drug-unit-validations" className="alert-link">
                 Review Unit Conversions &rarr;
-              </Link>
+              </Link>}
               <Link to="/hospital-drug-price-comparisons?status=unit_unresolved" className="alert-link">
-                Inspect Quarantined Rows &rarr;
+                {isAdmin ? "Inspect Quarantined Rows" : "View flagged comparison rows"} &rarr;
               </Link>
             </div>
           </div>
@@ -208,6 +254,28 @@ export default function Overview() {
               />
             );
           }}
+        </Loading>
+      </section>
+
+      <section className="dashboard-panel">
+        <div className="panel-header">
+          <div>
+            <h2 className="panel-title">Top drugs by estimated dollars at stake</h2>
+            <p className="panel-subtitle">Exposure proxy = CMS Part B spend multiplied by the positive portion of the median posted hospital rate markup above the ASP payment limit. This is not projected savings or hospital profit.</p>
+          </div>
+        </div>
+        <Loading state={drugs}>
+          {(rows) => <Table
+            rows={rows.filter((r) => r.estimated_dollars_at_stake_proxy != null)
+              .sort((a, b) => b.estimated_dollars_at_stake_proxy - a.estimated_dollars_at_stake_proxy).slice(0, 5)}
+            empty="CMS Part B spending or eligible released comparisons are unavailable."
+            columns={[
+              { key: "hcpcs", label: "HCPCS" }, { key: "name", label: "Drug" },
+              { key: "median_markup", label: "Median markup", num: true, render: (r) => fmt.x(r.median_markup) },
+              { key: "partb_spending_proxy", label: "Part B spend proxy", num: true, render: (r) => fmt.usd(r.partb_spending_proxy) },
+              { key: "estimated_dollars_at_stake_proxy", label: "Estimated exposure", num: true, render: (r) => fmt.usd(r.estimated_dollars_at_stake_proxy) },
+            ]}
+          />}
         </Loading>
       </section>
 
@@ -324,15 +392,17 @@ export default function Overview() {
                             {fmt.n(r.rates)}
                           </td>
                           <td>
-                            {r.reviewed_by ? (
+                            {isAdmin ? r.reviewed_by ? (
                               <span className="status-tag validated">✓ Clinical Review Passed</span>
                             ) : r.unresolved_unit_rows > 0 ? (
                               <span className="status-tag pending" title={`${r.unresolved_unit_rows} unresolved hospital units`}>
                                 Provisional ({r.unresolved_unit_rows} unres.)
                               </span>
                             ) : (
-                              <span className="status-tag ready">Clean Normalized</span>
-                            )}
+                              <span className="status-tag ready">Pending clinical review</span>
+                            ) : r.verification_status === "verified" ? (
+                              <span className="status-tag validated">✓ Clinically reviewed</span>
+                            ) : <span className="status-tag pending">Pending clinical review</span>}
                           </td>
                         </tr>
                       );
@@ -350,9 +420,9 @@ export default function Overview() {
             <Link to="/hospital-drug-price-comparisons" className="button-subtle">
               View All {m.rows == null ? "—" : fmt.n(m.rows)} Detailed Price Records &rarr;
             </Link>
-            <Link to="/drug-selection-scope" className="button-subtle">
+            {isAdmin && <Link to="/drug-selection-scope" className="button-subtle">
               View CMS Spending Ranking Evidence &rarr;
-            </Link>
+            </Link>}
           </div>
         </div>
       </section>

@@ -90,9 +90,11 @@ def test_two_role_model_keeps_viewer_out_of_admin_operations(client):
     viewer.groups.add(Group.objects.get_or_create(name=VIEWER_GROUP)[0])
     viewer_client = Client()
     viewer_client.force_login(viewer)
-    assert viewer_client.get("/api/v1/dashboard/summary/").status_code == 200
+    assert viewer_client.get("/api/v1/dashboard/summary/").status_code == 403
     assert viewer_client.get("/api/v1/sources/").status_code == 403
     assert viewer_client.get("/api/v1/sources/jobs/").status_code == 403
+    assert viewer_client.get("/api/v1/drug-selection-scope/").status_code == 403
+    assert viewer_client.get("/api/v1/user-accounts/").status_code == 403
 
 
 def test_staff_flag_alone_does_not_grant_application_admin(client):
@@ -171,7 +173,8 @@ def test_initialize_roles_creates_only_admin_and_viewer_and_user_management_perm
     }
 
 
-def test_password_login_issues_jwt_and_session_can_refresh(client):
+@pytest.mark.django_db
+def test_viewer_login_does_not_require_totp(client):
     from django.contrib.auth import get_user_model
     from django.contrib.auth.models import Group
     from django.test import Client
@@ -182,23 +185,99 @@ def test_password_login_issues_jwt_and_session_can_refresh(client):
     from pricing.permissions import VIEWER_GROUP
     user.groups.add(Group.objects.get_or_create(name=VIEWER_GROUP)[0])
     fresh_client = Client()
-    response = fresh_client.post("/api/v1/auth/login/", {
+    response = fresh_client.post("/api/v1/authentication/sign-in/", {
         "username": "jwt-viewer", "password": "long-test-password-123",
     }, content_type="application/json")
     assert response.status_code == 200
-    token = response.json()["access"]
+    assert "no-store" in response.headers.get("Cache-Control", "")
     assert response.json()["token_type"] == "Bearer"
-    assert fresh_client.get("/api/v1/auth/me/", HTTP_AUTHORIZATION=f"Bearer {token}").json()["authenticated"]
+    assert "otp_required" not in response.json()
+    assert "otp_setup_required" not in response.json()
+    token = response.json()["access"]
+    current_user = fresh_client.get(
+        "/api/v1/authentication/current-user/", HTTP_AUTHORIZATION=f"Bearer {token}")
+    assert current_user.json()["authenticated"]
 
-    # The HttpOnly Django session is the refresh credential and survives a page reload.
-    refresh = fresh_client.post("/api/v1/auth/refresh/", "{}", content_type="application/json")
-    assert refresh.status_code == 200
-    assert refresh.json()["access"]
 
-    token_only = Client()
-    rejected = token_only.post("/api/v1/auth/refresh/", "{}", content_type="application/json",
-                               HTTP_AUTHORIZATION=f"Bearer {token}")
-    assert rejected.status_code in {401, 403}
+@pytest.mark.django_db
+def test_admin_can_reset_viewer_password_and_viewer_can_sign_in(client):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.hashers import check_password
+    from django.contrib.auth.models import Group
+    from django.test import Client
+    from pricing.permissions import VIEWER_GROUP
+
+    viewer = get_user_model().objects.create_user(
+        username="resettable-viewer", password="old-viewer-password-123", is_active=True
+    )
+    viewer.groups.add(Group.objects.get_or_create(name=VIEWER_GROUP)[0])
+    new_password = "new-viewer-password-456"
+    response = client.post(
+        f"/api/v1/user-accounts/{viewer.pk}/management/",
+        {"password": new_password}, content_type="application/json",
+    )
+    assert response.status_code == 200
+    viewer.refresh_from_db()
+    assert check_password(new_password, viewer.password)
+
+    signed_in = Client().post("/api/v1/authentication/sign-in/", {
+        "username": viewer.username, "password": new_password,
+    }, content_type="application/json")
+    assert signed_in.status_code == 200
+    assert signed_in.json()["user"]["roles"] == [VIEWER_GROUP]
+    assert "otp_required" not in signed_in.json()
+
+
+@pytest.mark.django_db
+def test_admin_login_requires_totp_enrollment_before_session_refresh(client):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from django.test import Client, override_settings
+    from pricing.otp import code_at
+    from pricing.permissions import ADMIN_GROUP
+
+    user = get_user_model().objects.create_user(
+        username="jwt-admin", password="long-test-password-123", is_active=True
+    )
+    user.groups.add(Group.objects.get_or_create(name=ADMIN_GROUP)[0])
+    fresh_client = Client()
+    with override_settings(TOTP_ENCRYPTION_KEY="F5wrMMH6I5kTnhPaaWqFvxLQmNY4J5kmWh0-e4jxQYc="):
+        response = fresh_client.post("/api/v1/authentication/sign-in/", {
+            "username": "jwt-admin", "password": "long-test-password-123",
+        }, content_type="application/json")
+        assert response.status_code == 200
+        assert response.json()["otp_setup_required"] is True
+        challenge = response.json()["challenge"]
+
+        setup = fresh_client.post("/api/v1/authentication/totp/setup/", {
+            "challenge": challenge,
+        }, content_type="application/json")
+        assert setup.status_code == 200
+        assert "no-store" in setup.headers.get("Cache-Control", "")
+        assert setup.json()["otpauth_url"].startswith("otpauth://totp/")
+        code, _ = code_at(setup.json()["secret"])
+        confirmation = fresh_client.post("/api/v1/authentication/totp/confirmation/", {
+            "challenge": challenge, "code": code,
+        }, content_type="application/json")
+        assert confirmation.status_code == 200
+        assert "no-store" in confirmation.headers.get("Cache-Control", "")
+        token = confirmation.json()["access"]
+        assert confirmation.json()["token_type"] == "Bearer"
+        current_user = fresh_client.get(
+            "/api/v1/authentication/current-user/", HTTP_AUTHORIZATION=f"Bearer {token}")
+        assert current_user.json()["authenticated"]
+
+        # The HttpOnly Django session is the refresh credential and survives a page reload.
+        refresh = fresh_client.post("/api/v1/authentication/access-token/refresh/", "{}",
+                                    content_type="application/json")
+        assert refresh.status_code == 200
+        assert refresh.json()["access"]
+
+        token_only = Client()
+        rejected = token_only.post("/api/v1/authentication/access-token/refresh/", "{}",
+                                   content_type="application/json",
+                                   HTTP_AUTHORIZATION=f"Bearer {token}")
+        assert rejected.status_code in {401, 403}
 
 
 def test_password_login_requires_csrf_for_browser_sessions(client):
@@ -409,13 +488,14 @@ def test_drug_scope_and_settings_are_data_backed(client):
 def test_analyst_unit_review_is_bound_to_current_scope(client, tmp_path):
     ok = client.post("/api/v1/drug-scope/J9271/review/", {
         "status": "validated", "billing_qty": "1", "billing_unit": "MG",
+        "clinical_reviewer_name": "Test External Pharmacist",
         "notes": "Checked against the CMS dosage field.",
     }, content_type="application/json")
     assert ok.status_code == 200
     assert ok.json()["status"] == "validated"
     bad = client.post("/api/v1/drug-scope/J9271/review/", {
         "status": "validated", "billing_qty": "10", "billing_unit": "MG",
-        "notes": "Wrong unit.",
+        "clinical_reviewer_name": "Test External Pharmacist", "notes": "Wrong unit.",
     }, content_type="application/json")
     assert bad.status_code == 400
     assert "CMS ASP dosage" in bad.json()["error"]

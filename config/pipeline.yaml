@@ -17,14 +17,9 @@ review_range:
 #   latest    -> always the latest loaded ASP quarter
 benchmark_quarter: file_date
 
-# When a hospital prices per ML or per EA (vial), or posts no unit, read the
-# strength from the hospital's own description:
-#   "KEYTRUDA 25 MG/ML", 4 ML      -> 100 mg
-#   "REMICADE 100 MG", 1 EA        -> 100 mg
-#   "INJ DENOSUMAB 1 MG", no unit  -> 1 billing unit (only when the text equals
-#                                     the HCPCS billing unit)
-# Each such row is marked with unit_method so a reviewer can check it.
-units_from_description: true
+# Do not infer package contents or dosage from hospital description text.
+# The comparison pipeline uses config/units.yaml and verified NDC references.
+units_from_description: false
 
 # Hospital rows that give no drug unit are NOT converted (status
 # unit_unresolved). Set true only after a reviewer confirms that a hospital

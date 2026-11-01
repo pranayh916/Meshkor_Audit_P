@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 from collections import Counter, defaultdict
@@ -13,6 +14,7 @@ from statistics import median
 
 import pyarrow.parquet as pq
 import polars as pl
+from pipeline.common import csv_safe_cell
 
 
 ROOT = Path(__file__).resolve().parent
@@ -65,7 +67,8 @@ def write_csv(path: Path, columns: list[str], rows: list[dict]) -> None:
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows({key: csv_safe_cell(value) for key, value in row.items()}
+                          for row in rows)
 
 
 def stored_scope_status(run: dict, comparison_rows: list[dict],
@@ -124,6 +127,83 @@ def input_inventory(config: dict) -> list[dict]:
                 "files": sorted(matches),
             })
     return inventory
+
+
+def required_source_integrity(inventory: list[dict]) -> tuple[bool, list[str]]:
+    """Require original inputs and sidecars whose digests match the source bytes."""
+    problems = []
+    for item in inventory:
+        if not item["required"]:
+            continue
+        if not item["files"]:
+            problems.append(f"{item['key']}: no original input file")
+            continue
+        for source in item["files"]:
+            sidecar = source.with_name(source.name + ".sha256")
+            try:
+                expected = sidecar.read_text(encoding="ascii").strip().split()[0].lower()
+            except (OSError, IndexError, UnicodeError):
+                problems.append(f"{item['key']}: missing SHA-256 sidecar for {source.name}")
+                continue
+            if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+                problems.append(f"{item['key']}: invalid SHA-256 sidecar for {source.name}")
+                continue
+            digest = hashlib.sha256()
+            try:
+                with source.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError:
+                problems.append(f"{item['key']}: source became unavailable while checking {source.name}")
+                continue
+            if digest.hexdigest() != expected:
+                problems.append(f"{item['key']}: SHA-256 mismatch for {source.name}")
+    return not problems, problems
+
+
+def parquet_lineage_status(paths: dict[str, Path]) -> tuple[bool, list[str]]:
+    """Verify provenance embedded in the Parquet snapshot used by the report.
+
+    Raw downloads are ingestion inputs, not runtime dependencies. A complete
+    archived snapshot remains usable when those downloads have been removed,
+    provided the Parquet artifacts carry their source lineage.
+    """
+    lineage = [
+        ("comparison", paths["comparison"], ("source_file", "source_sha256")),
+        ("ASP reference", paths["asp"], ("source_file", "source_sha256")),
+        ("selected drug scope", paths["scope"],
+         ("selection_source_file", "selection_source_sha256")),
+        ("hospital rate", paths["hospital_rates"], ("source_file", "source_sha256")),
+        ("hospital quality", paths["quality"], ("source_file", "source_sha256")),
+    ]
+    problems = []
+    for label, path, required_columns in lineage:
+        if not path.is_file():
+            problems.append(f"{label}: Parquet artifact is missing")
+            continue
+        try:
+            parquet = pq.ParquetFile(path)
+            columns = set(parquet.schema_arrow.names)
+            missing = set(required_columns) - columns
+            if missing:
+                problems.append(f"{label}: Parquet lineage columns missing ({', '.join(sorted(missing))})")
+                continue
+            if parquet.metadata.num_rows == 0:
+                problems.append(f"{label}: Parquet artifact has no rows")
+                continue
+            empty_checks = [
+                pl.col(name).cast(pl.Utf8, strict=False).str.strip_chars().is_null()
+                | (pl.col(name).cast(pl.Utf8, strict=False).str.strip_chars() == "")
+                for name in required_columns
+            ]
+            missing_count = (pl.scan_parquet(path)
+                             .select(pl.any_horizontal(*empty_checks).sum().alias("missing"))
+                             .collect(engine="streaming").item())
+            if missing_count:
+                problems.append(f"{label}: {missing_count} rows have incomplete source lineage")
+        except (OSError, ValueError, pl.exceptions.PolarsError) as exc:
+            problems.append(f"{label}: Parquet lineage could not be verified ({exc})")
+    return not problems, problems
 
 
 def reference_coverage() -> dict:
@@ -222,9 +302,19 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
 
     selection_input_present = bool(next((i["files"] for i in inventory
                                          if i["key"] == config["selection_source"]), []))
+    original_sources_verified, source_integrity_problems = required_source_integrity(inventory)
     selected_hash = run.get("drug_selection_source_sha256")
     scope_current, scope_snapshot_status = stored_scope_status(
         run, rows, config, comparison_path)
+    scope_lookup: dict[str, dict] = {}
+    scope_path = ROOT / "data" / "ref" / "drug_scope.parquet"
+    if scope_path.is_file():
+        available = set(pq.ParquetFile(scope_path).schema_arrow.names)
+        wanted = [name for name in ("hcpcs", "partb_spending", "reviewed_by", "review_date",
+                                    "review_status", "review_notes") if name in available]
+        if "hcpcs" in wanted:
+            for item in pl.scan_parquet(scope_path).select(wanted).collect(engine="streaming").to_dicts():
+                scope_lookup[item["hcpcs"]] = item
     # A saved scope remains usable when its checksum agrees across the scope,
     # comparison, and run metadata. Raw CMS files are needed only for re-import.
     if not scope_current:
@@ -239,14 +329,20 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
         and len(drug_codes) >= config["target_drug_count"]
     )
     all_units_reviewed = bool(drug_codes) and len(reviewed_codes) == len(drug_codes)
-    required_parquets = [
-        comparison_path, quality_path, run_info_path,
-        ROOT / "data" / "ref" / "ref_asp.parquet",
-        ROOT / "data" / "ref" / "drug_scope.parquet",
-        ROOT / "data" / "hpt" / "norm" / "hpt_drug_rates.parquet",
-    ]
-    required_parquets_ready = all(path.is_file() for path in required_parquets)
-    draft = not (scope_complete and all_units_reviewed and required_parquets_ready)
+    required_parquets = {
+        "comparison": comparison_path,
+        "quality": quality_path,
+        "run_info": run_info_path,
+        "asp": ROOT / "data" / "ref" / "ref_asp.parquet",
+        "scope": ROOT / "data" / "ref" / "drug_scope.parquet",
+        "hospital_rates": ROOT / "data" / "hpt" / "norm" / "hpt_drug_rates.parquet",
+    }
+    required_parquets_ready = all(path.is_file() for path in required_parquets.values())
+    parquet_lineage_verified, parquet_lineage_problems = parquet_lineage_status(required_parquets)
+    # The operational dashboard and report are Parquet-backed. Original raw
+    # downloads are required only to ingest or refresh those stored artifacts.
+    draft = not (scope_complete and all_units_reviewed and required_parquets_ready
+                 and parquet_lineage_verified)
 
     status_counts = Counter(r.get("status") or "(missing)" for r in rows)
     all_systems = sorted({r.get("system") for r in rows if r.get("system")})
@@ -278,6 +374,12 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
             if finite_number(r.get("price_per_billing_unit")) is not None
             and finite_number(r.get("asp_payment_limit")) is not None
         ]
+        scope_row = scope_lookup.get(code, {})
+        partb_spending = finite_number(scope_row.get("partb_spending"))
+        estimated_dollars_at_stake = (
+            max(0.0, (median(markups) - 1.0) * partb_spending)
+            if partb_spending is not None else None
+        )
         summary_rows.append({
             "hcpcs": code,
             "drug_name": drug_names[code],
@@ -287,6 +389,12 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
             "min_markup": min(markups),
             "max_markup": max(markups),
             "median_dollars_over_benchmark_per_billing_unit": median(gaps) if gaps else None,
+            "partb_spending_proxy": partb_spending,
+            "estimated_dollars_at_stake_proxy": estimated_dollars_at_stake,
+            "clinical_reviewer_name": scope_row.get("reviewed_by") if code in reviewed_codes else None,
+            "clinical_review_date": scope_row.get("review_date") if code in reviewed_codes else None,
+            "clinical_review_status": scope_row.get("review_status") if code in reviewed_codes else None,
+            "clinical_review_notes": scope_row.get("review_notes") if code in reviewed_codes else None,
         })
     summary_rows.sort(key=lambda r: (-r["median_markup"], r["hcpcs"]))
 
@@ -366,6 +474,14 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
         str(i), r["hcpcs"], r["drug_name"], fmt_num(r["median_markup"], 2) + "×",
         str(r["hospital_sites"]), fmt_money(r["median_dollars_over_benchmark_per_billing_unit"]),
     ] for i, r in enumerate(summary_rows, 1)]
+    stake_rank = [[
+        str(i), r["hcpcs"], r["drug_name"], fmt_money(r.get("partb_spending_proxy")),
+        fmt_money(r.get("estimated_dollars_at_stake_proxy")), fmt_num(r["median_markup"], 2) + "×",
+    ] for i, r in enumerate(sorted(
+        summary_rows,
+        key=lambda row: (row.get("estimated_dollars_at_stake_proxy") is None,
+                         -(row.get("estimated_dollars_at_stake_proxy") or 0), row["hcpcs"]),
+    )[:5], 1)]
     statuses = [[status, f"{n:,}"] for status, n in status_counts.most_common()]
     inputs_rows = [[
         item["label"], "required" if item["required"] else "supplemental",
@@ -393,13 +509,17 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
         "file_date_max": max(file_dates) if file_dates else None,
         "draft": draft,
         "draft_reasons": {
-            "required_inputs_ready": required_parquets_ready,
+            "required_inputs_ready": parquet_lineage_verified,
             "required_parquets_ready": required_parquets_ready,
+            "parquet_lineage_problems": parquet_lineage_problems,
+            "raw_inputs_verified": original_sources_verified,
+            "raw_source_integrity_problems": source_integrity_problems,
             "scope_complete": scope_complete,
             "scope_current": scope_current,
             "all_units_reviewed": all_units_reviewed,
             "selection_source_files_present": selection_input_present,
             "scope_snapshot_status": scope_snapshot_status,
+            "data_source_mode": "raw_inputs_verified" if original_sources_verified else scope_snapshot_status,
         },
         "drug_count": len(drug_codes),
         "target_drug_count": target_count,
@@ -408,6 +528,8 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
         "drug_selection_source_sha256": selected_hash if scope_current else None,
         "reviewed_drug_count": len(reviewed_codes),
         "hospital_count": len(all_hospitals),
+        "hospitals_without_findable_file": None,
+        "hospital_coverage_note": "The Ohio hospital universe has not yet been reconciled to the machine-readable-file catalog; the number without a findable file is not available.",
         "system_count": len(all_systems),
         "systems": all_systems,
         "comparison_rows": len(rows),
@@ -418,6 +540,16 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
         "source_hash_rows": sum(bool(r.get("source_sha256")) for r in rows),
         "status_counts": [{"status": status, "count": count} for status, count in status_counts.most_common()],
         "drug_summary": summary_rows,
+        "top_drugs_by_dollars_at_stake": sorted(
+            summary_rows,
+            key=lambda row: (row.get("estimated_dollars_at_stake_proxy") is None,
+                             -(row.get("estimated_dollars_at_stake_proxy") or 0), row["hcpcs"]),
+        )[:5],
+        "dollars_at_stake_definition": (
+            "CMS Medicare Part B spending by drug multiplied by the positive portion of the "
+            "median posted hospital negotiated-rate markup above the CMS ASP payment limit. "
+            "This is an exposure proxy, not an estimate of savings or hospital profit."
+        ),
         "hospital_rates": site_rows,
         "source_inventory": source_rows,
         "inputs": input_summary,
@@ -430,7 +562,7 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
     }
     dashboard_data_path.write_text(json.dumps(dashboard_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    draft_label = "DRAFT" if draft else "REVIEWED"
+    draft_label = "DRAFT"
     report = f"""# {config['title']} — {draft_label}
 
 **Report generated:** {date.today().isoformat()}  
@@ -443,11 +575,15 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
 
 This run covers **{len(drug_codes)} current HCPCS drug codes**, **{len(all_hospitals)} hospital sites**, and **{len(all_systems)} hospital systems**. Configured codes: {', '.join(drug_codes) or 'none'}. Target scope: {target_count} codes. Selection source: `{selection_source}`. Scope snapshot: `{scope_snapshot_status}`. Original selection file present: {str(selection_input_present).lower()}. Unit-reviewed codes: {len(reviewed_codes)} of {len(drug_codes)}{'; unreviewed: ' + ', '.join(unreviewed_codes) if unreviewed_codes else ''}.
 
-The drug ranking is by median markup among rows matching the configured headline price type (`{config['headline_price_type']}`) and status (`{config['headline_status']}`). It ranks posted hospital rates, not employer claims or plan savings. “Dollars over benchmark” is the median additional price **per HCPCS billing unit**; it is not total dollars at stake.
+The first ranking is by median markup among rows matching the configured headline price type (`{config['headline_price_type']}`) and status (`{config['headline_status']}`). The “dollars at stake” ranking is an exposure proxy: CMS Medicare Part B spending for the drug multiplied by the positive portion of the median posted hospital rate markup above the ASP payment limit. It is not a savings estimate, hospital profit, or a guarantee that the same volume could move to another site. It assumes Medicare spending is a usable volume proxy for the posted hospital rates.
 
 ## Drug ranking
 
 {markdown_table(['Rank', 'HCPCS', 'Drug', 'Median markup', 'Hospitals', 'Median $ over benchmark per billing unit'], rate_rank)}
+
+### Top five by estimated dollars at stake
+
+{markdown_table(['Rank', 'HCPCS', 'Drug', 'CMS Part B spend proxy', 'Estimated exposure proxy', 'Median markup'], stake_rank)}
 
 Individual hospital comparisons, including payer-plan counts and unit-review flags, are in [`{outputs['sites']}`]({outputs['sites']}). Lower-markup sites are leads for further review; the report does not establish network status, clinical suitability, or physician agreement.
 
@@ -477,16 +613,21 @@ Rows outside the configured headline status are excluded from headline medians.
 
 ## Limits and readiness
 
-- Required Parquet artifacts ready: {str(required_parquets_ready).lower()}; uploaded source files are needed only when importing a new snapshot.
+- Required Parquet artifacts ready: {str(required_parquets_ready).lower()}.
+- Source lineage embedded in the required Parquet artifacts is complete: {str(parquet_lineage_verified).lower()}.
+- Parquet lineage issues: {', '.join(parquet_lineage_problems) if parquet_lineage_problems else 'none'}.
+- Original raw inputs present with matching SHA-256 sidecars: {str(original_sources_verified).lower()}; raw files are needed to re-import, not to read the saved Parquet snapshot.
+- Raw source availability or integrity notes: {', '.join(source_integrity_problems) if source_integrity_problems else 'none'}.
 - Original configured input files currently present: {sum(bool(i['files']) for i in inventory if i['required'])} of {sum(i['required'] for i in inventory)}.
 - Drug scope meets the configured count and selection-evidence requirement: {str(scope_complete).lower()}.
 - All configured drug codes have a manual review flag: {str(all_units_reviewed).lower()}.
 - Hospital coverage observed in the comparison: {len(all_hospitals)} sites across {len(all_systems)} systems; completeness is determined by the configured coverage inputs.
-- Input readiness: {'ready' if not draft else 'incomplete; review the configured input inventory and unit-review status before external use'}.
+- Hospitals with no findable price file: not available; the current provider universe has not been reconciled to the MRF catalog.
+- Input readiness: {'ready from the current Parquet snapshot' if not draft else 'incomplete; review the Parquet lineage, scope, and clinical unit-review status before external use'}.
 
 ## Report status
 
-{'This report is marked draft because one or more configured source, scope, or review requirements are unmet.' if draft else 'Configured source, scope, and review requirements are met.'}
+{'This report is a draft because one or more configured source, scope, or review requirements are unmet.' if draft else 'Source, scope, and clinical review checks are ready; an independent Admin must still release the report. Until then, this report remains a draft.'}
 """
     report_path = output_dir / outputs["report"]
     report_path.write_text(report, encoding="utf-8")

@@ -3,7 +3,8 @@ import { fmt, useApi } from "../api.js";
 import { Loading, MarkupBars, Provisional, StatusPill, Table } from "../components.jsx";
 import RatesTable from "./RatesTable.jsx";
 
-export default function DrugDetail() {
+export default function DrugDetail({ user }) {
+  const isAdmin = user?.roles?.includes("Admin");
   const { hcpcs } = useParams();
   const d = useApi(`medicare-part-b-drugs/${hcpcs}`, null, [hcpcs]);
   return (
@@ -11,16 +12,19 @@ export default function DrugDetail() {
       {(drug) => (
         <>
           <section>
-            <div className="crumb"><Link to="/drug-selection-scope">Drug Selection Scope</Link> / {drug.hcpcs}</div>
+            <div className="crumb">{isAdmin ? <><Link to="/drug-selection-scope">Drug Selection Scope</Link> / </> : null}{drug.hcpcs}</div>
             <h1>{drug.hcpcs} · {drug.name} <span className="muted">{drug.brand}</span></h1>
             <p className="lede">HCPCS billing unit: <b>{drug.billing_unit}</b>. Every hospital
               rate is converted to this unit before it is compared.</p>
-            <Provisional reviewed={!!drug.reviewed_by} />
-            <div className="status-row">
+            {isAdmin && <Provisional reviewed={!!drug.reviewed_by} />}
+            <p className="muted">Clinical review: <b>{drug.verification_status === "verified" ? "Verified" : drug.verification_status || "Pending clinical review"}</b>
+              {drug.clinical_reviewer_name ? ` · ${drug.clinical_reviewer_name}` : ""}
+              {drug.clinical_reviewed_at ? ` · ${new Date(drug.clinical_reviewed_at).toLocaleDateString()}` : ""}</p>
+            {isAdmin && <div className="status-row">
               {drug.statuses.map((s) => (
                 <span key={s.status}><StatusPill status={s.status} /> {fmt.n(s.n)}</span>
               ))}
-            </div>
+            </div>}
           </section>
 
           <div className="grid2">
@@ -71,7 +75,7 @@ export default function DrugDetail() {
 
           <section>
             <h2>Every rate for {drug.hcpcs}</h2>
-            <RatesTable fixed={{ hcpcs: drug.hcpcs }} />
+            <RatesTable fixed={{ hcpcs: drug.hcpcs }} user={user} />
           </section>
         </>
       )}

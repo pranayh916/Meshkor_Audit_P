@@ -4,6 +4,7 @@ import { postJSON, useApi } from "../api.js";
 import { Loading } from "../components.jsx";
 
 function UserAuthenticator({ user }) {
+  if (!user?.roles?.includes("Admin")) return null;
   const [version, setVersion] = useState(0);
   const [enrollment, setEnrollment] = useState(null);
   const [recoveryCodes, setRecoveryCodes] = useState([]);
@@ -29,7 +30,7 @@ function UserAuthenticator({ user }) {
 
   return <section>
     <h2>Google Authenticator</h2>
-    <p>A rotating authenticator code is required for every account after the password.</p>
+    <p>Every Admin signs in with a rotating authenticator code after the password. Viewer accounts use password sign-in.</p>
     <Loading state={otp}>{(state) => <>
       <p>Status: <b>{state.enabled ? "Enabled" : state.setup_pending ? "Setup in progress" : "Off"}</b></p>
       {!state.enabled && !enrollment && <button className="button" type="button" onClick={() => run("setup")} disabled={busy}>Set up Google Authenticator</button>}
@@ -66,16 +67,25 @@ function UserAuthenticator({ user }) {
   </section>;
 }
 
-export default function Settings({ user }) {
+function AdminConfiguration() {
   const state = useApi("application-settings");
   return <>
-    <h1>Settings</h1>
-    <p className="lede">Read-only view of configuration used by the current application build. Edit versioned project configuration, then rebuild data to change analytical behavior.</p>
     <Loading state={state}>{(cfg) => <>
       <section><h2>Report scope</h2><p>{cfg.report.title} · Target {cfg.report.target_drug_count} drugs</p><ul>{cfg.report.required_inputs.map((x) => <li key={x.key}>{x.label}: {x.purpose}</li>)}</ul></section>
-      <section><h2>Comparison rules</h2><p>Benchmark quarter: <code>{cfg.comparison.benchmark_quarter}</code></p><p>Review range: <code>{cfg.comparison.review_range?.join("× to ")}×</code></p><p>Operational database: <code>{cfg.database_backend}</code></p><p>Hospital market frame: <code>{cfg.hospital_taxonomy.state_code}</code> · {cfg.hospital_taxonomy.hospital_types.join(", ")}</p></section>
-      <section><h2>Planned employer audit</h2><p>{cfg.plan_specific_audit}. Member-level claims are not accepted by this application.</p></section>
+      <section><h2>Comparison rules</h2><p>Benchmark quarter: <code>{cfg.comparison.benchmark_quarter}</code></p><p>Review range: <code>{cfg.comparison.review_range?.join("× to ")}×</code></p><p>Operational database: <code>{cfg.database_backend}</code></p><p>Hospital market frame: <code>{cfg.hospital_taxonomy.state_code}</code> · {cfg.hospital_taxonomy.hospital_types.join(", ")}</p><p>Included primary taxonomy codes: <code>{cfg.hospital_taxonomy.taxonomy_codes.join(", ") || "None configured"}</code></p><p>Border ZIP3 codes: <code>{cfg.hospital_taxonomy.border_zip3.join(", ") || "None configured"}</code></p></section>
+      <section><h2>Unit conversion policy</h2><p>{cfg.units.unresolved_policy}</p><p>Mass conversion factors (mg base): <code>{Object.entries(cfg.units.mass_to_mg).map(([unit, factor]) => `${unit}=${factor}`).join(", ")}</code></p><p>Volume and package units require verified NDC reference data; no conversion is inferred from hospital description text.</p></section>
     </>}</Loading>
+  </>;
+}
+
+export default function Settings({ user }) {
+  const isAdmin = user?.roles?.includes("Admin");
+  return <>
+    <h1>{isAdmin ? "Application settings" : "Account security"}</h1>
+    <p className="lede">{isAdmin
+      ? "Read-only project configuration and account security controls. Analytical rules are defined in the versioned project configuration."
+      : "Authenticator verification is required for Admin accounts. Your Viewer account uses password sign-in."}</p>
+    {isAdmin && <AdminConfiguration />}
     <UserAuthenticator user={user} />
   </>;
 }
