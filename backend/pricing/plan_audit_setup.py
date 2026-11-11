@@ -1,12 +1,17 @@
 """Organization, plan, Viewer access, and plan network-roster APIs."""
 import csv
 import hashlib
+import heapq
 import io
+from bisect import bisect_right
+from datetime import date
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.db.models import Count
 from django.http import Http404
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes, parser_classes
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
@@ -41,7 +46,8 @@ def _safe_roster_rows(reader):
 @permission_classes([CanView])
 def organizations(request):
     if request.method == "GET":
-        return Response([organization_payload(item) for item in visible_organizations(request.user)])
+        queryset = PlanOrganization.objects.all() if is_admin(request.user) else visible_organizations(request.user)
+        return Response([organization_payload(item) for item in queryset])
     denied = _admin_required(request)
     if denied:
         return denied
@@ -56,6 +62,34 @@ def organizations(request):
     AuditEvent.objects.create(actor=request.user, action="plan_organization_created",
                               entity_type="plan_organization", entity_id=str(item.pk))
     return Response(organization_payload(item), status=201)
+
+
+@api_view(["PATCH"])
+@permission_classes([CanView])
+def organization_status(request, organization_id):
+    denied = _admin_required(request)
+    if denied:
+        return denied
+    if set(request.data.keys()) != {"status"}:
+        return Response({"error": "Only status may be updated."}, status=400)
+    allowed_statuses = {value for value, _label in PlanOrganization.STATUS_CHOICES}
+    new_status = request.data.get("status")
+    if not isinstance(new_status, str) or new_status not in allowed_statuses:
+        return Response({"error": "status is invalid."}, status=400)
+    with transaction.atomic():
+        organization = get_object_or_404(PlanOrganization.objects.select_for_update(), pk=organization_id)
+        previous_status = organization.status
+        if previous_status != new_status:
+            organization.status = new_status
+            organization.save(update_fields=["status"])
+            changed_at = timezone.now()
+            AuditEvent.objects.create(
+                actor=request.user, action="plan_organization_status_changed",
+                entity_type="plan_organization", entity_id=str(organization.pk),
+                details={"previous_status": previous_status, "new_status": new_status,
+                         "timestamp": changed_at.isoformat()},
+            )
+    return Response(organization_payload(organization))
 
 
 @api_view(["GET", "POST"])
@@ -109,8 +143,12 @@ def organization_access_detail(request, organization_id, user_id):
 @permission_classes([CanView])
 def plans(request):
     if request.method == "GET":
-        queryset = Plan.objects.select_related("organization").filter(
-            organization__in=visible_organizations(request.user), status="active")
+        if is_admin(request.user):
+            queryset = Plan.objects.select_related("organization").all()
+        else:
+            queryset = Plan.objects.select_related("organization").filter(
+                organization__in=visible_organizations(request.user), status="active",
+                organization__status="active")
         organization_id = request.query_params.get("organization_id")
         if organization_id:
             queryset = queryset.filter(organization_id=organization_id)
@@ -145,7 +183,10 @@ def plans(request):
 @api_view(["GET", "PATCH"])
 @permission_classes([CanView])
 def plan_detail(request, plan_id):
-    item = get_visible_plan(request.user, plan_id)
+    if request.method == "PATCH" and is_admin(request.user):
+        item = get_object_or_404(Plan.objects.select_related("organization"), pk=plan_id)
+    else:
+        item = get_visible_plan(request.user, plan_id)
     if request.method == "GET":
         return Response(plan_payload(item))
     denied = _admin_required(request)
@@ -170,12 +211,26 @@ def plan_detail(request, plan_id):
     if item.effective_start and item.effective_end and item.effective_end < item.effective_start:
         return Response({"error": "effective_end must not precede effective_start."}, status=400)
     if "status" in request.data:
-        if request.data["status"] not in {"active", "inactive"}:
+        allowed_statuses = {value for value, _label in Plan.STATUS_CHOICES}
+        if not isinstance(request.data["status"], str) or request.data["status"] not in allowed_statuses:
             return Response({"error": "status must be active or inactive."}, status=400)
         item.status = request.data["status"]
-    item.save()
-    AuditEvent.objects.create(actor=request.user, action="plan_updated",
-                              entity_type="plan", entity_id=str(item.pk))
+    with transaction.atomic():
+        organization = PlanOrganization.objects.select_for_update().get(pk=item.organization_id)
+        previous_status = Plan.objects.select_for_update().values_list("status", flat=True).get(pk=item.pk)
+        if organization.status != "active" and item.status == "active":
+            return Response({"error": "An inactive organization must be activated before its plan."}, status=400)
+        item.save()
+        if previous_status != item.status:
+            changed_at = timezone.now()
+            AuditEvent.objects.create(actor=request.user, action="plan_status_changed",
+                                      entity_type="plan", entity_id=str(item.pk),
+                                      details={"previous_status": previous_status,
+                                               "new_status": item.status,
+                                               "timestamp": changed_at.isoformat()})
+        else:
+            AuditEvent.objects.create(actor=request.user, action="plan_updated",
+                                      entity_type="plan", entity_id=str(item.pk))
     return Response(plan_payload(item))
 
 
@@ -310,24 +365,55 @@ def _intervals_overlap(first_start, first_end, second_start, second_end):
 
 def _conflicting_roster_rows(rows):
     conflicts = set()
+    grouped = {}
     for index, item in enumerate(rows):
-        for other_index in range(index):
-            other = rows[other_index]
-            if (item.provider_npi == other.provider_npi
-                    and item.network_status != other.network_status
-                    and _intervals_overlap(item.effective_start, item.effective_end,
-                                           other.effective_start, other.effective_end)):
-                conflicts.update((index + 2, other_index + 2))
+        grouped.setdefault(item.provider_npi, []).append((index, item))
+    infinity = date.max
+    for intervals in grouped.values():
+        intervals.sort(key=lambda pair: (pair[1].effective_start, pair[0]))
+        active = {"in_network": {}, "out_of_network": {}}
+        unreported = {"in_network": set(), "out_of_network": set()}
+        expirations = []
+        for index, item in intervals:
+            while expirations and expirations[0][0] < item.effective_start:
+                _end, status, expired_index = heapq.heappop(expirations)
+                active[status].pop(expired_index, None)
+                unreported[status].discard(expired_index)
+            opposite = "out_of_network" if item.network_status == "in_network" else "in_network"
+            if active[opposite]:
+                conflicts.add(index + 2)
+                conflicts.update(other_index + 2 for other_index in unreported[opposite])
+                unreported[opposite].clear()
+            end = item.effective_end or infinity
+            active[item.network_status][index] = end
+            if not active[opposite]:
+                unreported[item.network_status].add(index)
+            heapq.heappush(expirations, (end, item.network_status, index))
     return sorted(conflicts)
 
 
 def _conflicting_roster_entries(rows, existing):
     conflicts = set()
+    grouped = {}
+    infinity = date.max
+    for other in existing:
+        grouped.setdefault((other.provider_npi, other.network_status), []).append(
+            (other.effective_start, other.effective_end or infinity))
+    indexes = {}
+    for key, intervals in grouped.items():
+        intervals.sort(key=lambda item: item[0])
+        starts, max_ends, latest_end = [], [], date.min
+        for start, end in intervals:
+            starts.append(start)
+            latest_end = max(latest_end, end)
+            max_ends.append(latest_end)
+        indexes[key] = (starts, max_ends)
     for index, item in enumerate(rows, start=2):
-        if any(item.provider_npi == other.provider_npi
-               and item.network_status != other.network_status
-               and _intervals_overlap(item.effective_start, item.effective_end,
-                                      other.effective_start, other.effective_end)
-               for other in existing):
-            conflicts.add(index)
+        for status in {"in_network", "out_of_network"} - {item.network_status}:
+            starts, max_ends = indexes.get((item.provider_npi, status), ([], []))
+            end = item.effective_end or infinity
+            position = bisect_right(starts, end) - 1
+            if position >= 0 and max_ends[position] >= item.effective_start:
+                conflicts.add(index)
+                break
     return sorted(conflicts)

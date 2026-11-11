@@ -118,6 +118,19 @@ export async function getJSON(path, params) {
   return request(path + qs);
 }
 
+export async function getAllPages(path, params = {}) {
+  const first = await getJSON(path, { ...params, page: 1 });
+  if (Array.isArray(first)) return first;
+  const items = [...(first.results || [])];
+  let page = first.next;
+  while (page != null) {
+    const result = await getJSON(path, { ...params, page, page_size: first.page_size });
+    items.push(...(result.results || []));
+    page = result.next;
+  }
+  return items;
+}
+
 export async function login(username, password) {
   accessToken = null;
   await request(API_ENDPOINTS.csrfToken);

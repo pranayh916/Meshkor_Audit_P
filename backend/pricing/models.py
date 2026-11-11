@@ -189,7 +189,7 @@ class ClaimsSummaryImport(models.Model):
     class Meta:
         ordering = ["-imported_at"]
         constraints = [
-            models.UniqueConstraint(fields=["plan", "file_hash"], name="summary_import_plan_hash_unique"),
+            models.UniqueConstraint(fields=["plan", "file_hash"], condition=models.Q(import_status="accepted"), name="summary_import_plan_hash_unique"),
         ]
 
     def __str__(self):
@@ -280,6 +280,7 @@ class PlanAudit(models.Model):
     summary = models.JSONField(default=dict, blank=True)
     current_version = models.PositiveIntegerField(default=0)
     published_version = models.PositiveIntegerField(null=True, blank=True)
+    run_owner_token = models.CharField(max_length=64, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -316,6 +317,8 @@ class PlanAuditRun(models.Model):
     review_status = models.CharField(max_length=16, default="pending")
     approved_at = models.DateTimeField(null=True, blank=True)
     started_at = models.DateTimeField()
+    worker_id = models.CharField(max_length=64, blank=True, db_index=True)
+    heartbeat_at = models.DateTimeField(null=True, blank=True, db_index=True)
     completed_at = models.DateTimeField(null=True, blank=True)
     published_at = models.DateTimeField(null=True, blank=True)
     revoked_at = models.DateTimeField(null=True, blank=True)
@@ -324,7 +327,9 @@ class PlanAuditRun(models.Model):
     class Meta:
         ordering = ["-version"]
         constraints = [models.UniqueConstraint(fields=["plan_audit", "version"],
-                                                name="plan_audit_run_version_unique")]
+                                                name="plan_audit_run_version_unique"),
+                       models.UniqueConstraint(fields=["plan_audit"], condition=models.Q(calculation_status="running"),
+                                               name="plan_audit_one_running_run_unique")]
 
 
 class PlanAuditArtifact(models.Model):

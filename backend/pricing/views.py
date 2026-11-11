@@ -399,7 +399,7 @@ def sources(request):
 
 
 @api_view(["POST"])
-@permission_classes([CanAnalyze])
+@permission_classes([CanAdminister])
 @parser_classes([MultiPartParser, FormParser])
 def source_upload(request):
     upload = request.FILES.get("file")
@@ -534,6 +534,8 @@ def _start_processing_worker(job):
 @permission_classes([CanAnalyze])
 def processing_jobs(request):
     if request.method == "POST":
+        if not has_any_role(request.user, {SUPER_ADMIN_GROUP}):
+            return Response({"error": "This action requires the Super Admin role."}, status=403)
         job_type = str(request.data.get("job_type", "")).strip()
         if job_type not in {"refresh_data", "market_report"}:
             return Response({"error": "job_type must be refresh_data or market_report."}, status=400)
@@ -1302,6 +1304,11 @@ def _comparison_column_names() -> set[str]:
 
 
 def _authorized_rate_filters(request):
+    if (has_any_role(request.user, {CLIENT_GROUP, VIEWER_GROUP})
+            and not has_any_role(request.user, {SUPER_ADMIN_GROUP, ANALYST_GROUP, REVIEWER_GROUP})
+            and request.path.rstrip("/").endswith(("/rates.csv", "/comparisons.csv"))):
+        return None, None, None, Response(
+            {"error": "This legacy export is restricted to internal accounts."}, status=403)
     payload, denied = _viewer_release_payload(request)
     if denied:
         return None, None, None, denied

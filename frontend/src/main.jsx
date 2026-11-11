@@ -250,7 +250,7 @@ function Shell({ user, onLogout, theme, onToggleTheme }) {
             <summary><span aria-hidden="true">•••</span><span className="nav-label">More</span></summary>
             <div className="sidebar-subnav">
               <NavLink to="/methodology">Methodology</NavLink>
-              {canAccess(user, "admin") && <>
+              {canAccess(user, "analyst") && <>
                 <NavLink to="/hospital-price-transparency-files">Hospital Price Files</NavLink>
                 <NavLink to="/reference-data-sets">Reference Data Sets</NavLink>
                 <NavLink to="/hospital-file-quality">Hospital File Quality</NavLink>
@@ -283,15 +283,15 @@ function Shell({ user, onLogout, theme, onToggleTheme }) {
         <Suspense fallback={<div className="auth-loading" role="status">Loading page…</div>}>
         <Routes>
           <Route path="/" element={<Overview user={user} />} />
-          <Route path="/reference-data-sets" element={<RequirePolicy user={user} policy="admin"><ReferenceData /></RequirePolicy>} />
-          <Route path="/hospital-price-transparency-files" element={<RequirePolicy user={user} policy="admin"><HospitalFiles /></RequirePolicy>} />
+          <Route path="/reference-data-sets" element={<RequirePolicy user={user} policy="analyst"><ReferenceData /></RequirePolicy>} />
+          <Route path="/hospital-price-transparency-files" element={<RequirePolicy user={user} policy="analyst"><HospitalFiles /></RequirePolicy>} />
           <Route path="/medicare-part-b-drugs/:hcpcs" element={<DrugDetail user={user} />} />
           <Route path="/hospitals" element={<Hospitals user={user} />} />
           <Route path="/hospitals/:key" element={<HospitalDetail user={user} />} />
           <Route path="/drug-selection-scope" element={<RequirePolicy user={user} policy="drugScope"><DrugScope user={user} /></RequirePolicy>} />
           <Route path="/drug-unit-validations" element={<RequirePolicy user={user} policy="reviewer"><UnitValidation user={user} /></RequirePolicy>} />
           <Route path="/hospital-drug-price-comparisons" element={<Rates user={user} />} />
-          <Route path="/hospital-file-quality" element={<RequirePolicy user={user} policy="admin"><Quality /></RequirePolicy>} />
+          <Route path="/hospital-file-quality" element={<RequirePolicy user={user} policy="analyst"><Quality /></RequirePolicy>} />
           <Route path="/data-sources" element={<RequirePolicy user={user} policy="analyst"><Sources user={user} /></RequirePolicy>} />
           <Route path="/reports" element={<Reports user={user} />} />
           <Route path="/plan-specific-audits" element={<RequirePolicy user={user} policy="planAudits">{isClientOnly(user) ? <ClientPlanAudits /> : <PlanAudits user={user} />}</RequirePolicy>} />

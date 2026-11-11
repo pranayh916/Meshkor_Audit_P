@@ -240,7 +240,8 @@ def test_four_role_backend_permission_matrix():
     }
     for index, (role, decisions) in enumerate(expected.items()):
         user = User.objects.create_user(username=f"role-{index}", password="role-test-password")
-        user.groups.add(Group.objects.get(name=role))
+        role_group, _ = Group.objects.get_or_create(name=role)
+        user.groups.add(role_group)
         request = SimpleNamespace(user=user, method="POST", path="/api/role-check/")
         actual = tuple(permission().has_permission(request, None) for permission in
                        (CanView, CanAnalyze, CanAdminister, CanReview))
@@ -271,6 +272,353 @@ def test_four_role_backend_permission_matrix():
     assert not CanView().has_permission(client_imports_request, None)
     assert not CanView().has_permission(client_org_users_request, None)
     assert CanView().has_permission(client_published_results_request, None)
+
+
+@pytest.mark.django_db
+def test_mk26_platform_writes_and_mk29_reviewer_import_inventory_are_denied(client, monkeypatch):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from rest_framework.test import APIRequestFactory, force_authenticate
+    from pricing.permissions import APPLICATION_ROLES
+    from pricing import plan_audit_imports, views
+
+    factory = APIRequestFactory()
+    monkeypatch.setattr(views, "_start_processing_worker", lambda job: False)
+    for role in APPLICATION_ROLES:
+        user = get_user_model().objects.create_user(
+            username=f"mk26-{role.lower()}", password="test-only-password")
+        user.groups.add(Group.objects.get_or_create(name=role)[0])
+        request = factory.post("/api/v1/data-sources/processing-jobs/",
+                               {"job_type": "refresh_data"}, format="json")
+        force_authenticate(request, user=user)
+        response = views.processing_jobs(request)
+        assert response.status_code == (503 if role == "SUPER_ADMIN" else 403)
+
+        upload = factory.post("/api/v1/data-sources/upload/", {}, format="multipart")
+        force_authenticate(upload, user=user)
+        assert views.source_upload(upload).status_code == (400 if role == "SUPER_ADMIN" else 403)
+
+        imports = factory.get("/api/v1/plan-audits/imports/")
+        force_authenticate(imports, user=user)
+        result = plan_audit_imports.plan_summary_imports(imports)
+        assert result.status_code == (200 if role in {"SUPER_ADMIN", "ANALYST"} else 403)
+
+
+@pytest.mark.django_db
+def test_import_inventory_and_audit_creation_use_accepted_tenant_scoped_imports(client):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from rest_framework.test import APIRequestFactory, force_authenticate
+    from pricing.models import (ClaimsSummaryImport, Plan, PlanAudit,
+                                PlanOrganization, PlanOrganizationAccess)
+    from pricing import plan_audit_imports
+
+    User = get_user_model()
+    admin = User.objects.get(username="audit-test-admin")
+    analyst = User.objects.create_user(username="mk30-import-analyst", password="test-password")
+    analyst.groups.add(Group.objects.get_or_create(name="ANALYST")[0])
+    reviewer = User.objects.create_user(username="mk30-import-reviewer", password="test-password")
+    reviewer.groups.add(Group.objects.get_or_create(name="REVIEWER")[0])
+    client_user = User.objects.create_user(username="mk30-import-client", password="test-password")
+    client_user.groups.add(Group.objects.get_or_create(name="CLIENT")[0])
+
+    organization = PlanOrganization.objects.create(
+        organization_name="MK30 Assigned Import Org", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="Assigned plan",
+                               plan_reference="MK30-ASSIGNED")
+    foreign_org = PlanOrganization.objects.create(
+        organization_name="MK30 Foreign Import Org", organization_type="employer")
+    foreign_plan = Plan.objects.create(organization=foreign_org, plan_name="Foreign plan",
+                                       plan_reference="MK30-FOREIGN")
+    PlanOrganizationAccess.objects.create(organization=organization, user=analyst, granted_by=admin)
+
+    accepted = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="accepted-synthetic.csv",
+        file_hash="a" * 64, schema_version="test-v1", import_status="accepted",
+        source_period="2026Q4")
+    rejected = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="rejected-synthetic.csv",
+        file_hash="b" * 64, schema_version="test-v1", import_status="rejected")
+    foreign = ClaimsSummaryImport.objects.create(
+        organization=foreign_org, plan=foreign_plan, source_file_name="foreign-synthetic.csv",
+        file_hash="c" * 64, schema_version="test-v1", import_status="accepted")
+
+    factory = APIRequestFactory()
+
+    admin_list = client.get(f"/api/v1/plan-audits/imports/?plan_id={plan.pk}")
+    assert admin_list.status_code == 200
+    assert {item["id"] for item in admin_list.json()["results"]} == {accepted.pk, rejected.pk}
+
+    def call(user, method, view, path, data=None, **kwargs):
+        request = (factory.get(path) if method == "GET" else
+                   factory.post(path, data, format="json"))
+        force_authenticate(request, user=user)
+        return view(request, **kwargs)
+
+    analyst_list = call(analyst, "GET", plan_audit_imports.plan_summary_imports,
+                        "/api/v1/plan-audits/imports/")
+    assert analyst_list.status_code == 200
+    assert {item["id"] for item in analyst_list.data["results"]} == {accepted.pk, rejected.pk}
+    assert foreign.pk not in {item["id"] for item in analyst_list.data["results"]}
+    assert call(reviewer, "GET", plan_audit_imports.plan_summary_imports,
+                "/api/v1/plan-audits/imports/").status_code == 403
+    assert call(client_user, "GET", plan_audit_imports.plan_summary_imports,
+                "/api/v1/plan-audits/imports/").status_code == 403
+
+    from pricing.plan_audit_imports import create_plan_audit
+    accepted_response = call(analyst, "POST", create_plan_audit, "/api/v1/plan-audits/create/", {
+        "organization_id": organization.pk, "plan_id": plan.pk,
+        "summary_import_id": accepted.pk, "audit_name": "Accepted synthetic audit",
+    })
+    assert accepted_response.status_code == 201, accepted_response.data
+    created = PlanAudit.objects.get(pk=accepted_response.data["id"])
+    assert created.summary_import_id == accepted.pk
+
+    for bad_import in (rejected, foreign):
+        response = call(analyst, "POST", create_plan_audit, "/api/v1/plan-audits/create/", {
+            "organization_id": organization.pk, "plan_id": plan.pk,
+            "summary_import_id": bad_import.pk, "audit_name": "Invalid synthetic audit",
+        })
+        assert response.status_code == 400
+
+    assert call(reviewer, "POST", create_plan_audit, "/api/v1/plan-audits/create/", {}).status_code == 403
+    assert call(client_user, "POST", create_plan_audit, "/api/v1/plan-audits/create/", {}).status_code == 403
+
+
+@pytest.mark.django_db
+def test_a10_import_and_audit_lists_paginate_all_records_with_stable_navigation(client):
+    from pricing.models import ClaimsSummaryImport, Plan, PlanAudit, PlanOrganization
+
+    organization = PlanOrganization.objects.create(
+        organization_name="A10 Pagination Test", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="Pagination Plan",
+                               plan_reference="A10-PAGINATION-PLAN")
+    summary_import = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="pagination.csv",
+        file_hash="a10" * 21 + "a", schema_version="1.0", import_status="accepted")
+    ClaimsSummaryImport.objects.bulk_create([
+        ClaimsSummaryImport(organization=organization, plan=plan,
+            source_file_name=f"import-{index}.csv", file_hash=f"{index:064x}",
+            schema_version="1.0", import_status="rejected")
+        for index in range(204)
+    ])
+    PlanAudit.objects.bulk_create([
+        PlanAudit(organization=organization, plan=plan, summary_import=summary_import,
+            audit_name=f"Audit {index}", reporting_period="2026Q1")
+        for index in range(205)
+    ])
+
+    def collect(path):
+        first = client.get(f"{path}?plan_id={plan.pk}&page_size=50")
+        assert first.status_code == 200
+        payload = first.json()
+        assert payload["count"] == 205
+        assert payload["page"] == 1
+        assert payload["previous"] is None and payload["next"] == 2
+        records = list(payload["results"])
+        while payload["next"] is not None:
+            payload = client.get(
+                f"{path}?plan_id={plan.pk}&page_size=50&page={payload['next']}"
+            ).json()
+            records.extend(payload["results"])
+        assert payload["next"] is None
+        assert payload["previous"] == 4
+        assert len(records) == len({item["id"] for item in records}) == 205
+        return records
+
+    assert len(collect("/api/v1/plan-audits/imports/")) == 205
+    assert len(collect("/api/v1/plan-audits/")) == 205
+    assert client.get(f"/api/v1/plan-audits/?plan_id={plan.pk}&page=0").status_code == 400
+
+
+def test_a09_provider_grouped_interval_validation_preserves_overlap_rules_and_scales():
+    from datetime import date, timedelta
+    from time import perf_counter
+    from types import SimpleNamespace
+    from pricing.plan_audit_setup import _conflicting_roster_entries, _conflicting_roster_rows
+
+    def interval(provider, status, start, end=None):
+        return SimpleNamespace(provider_npi=provider, network_status=status,
+                               effective_start=start, effective_end=end)
+
+    rows = [
+        interval("provider-a", "in_network", date(2026, 1, 1), date(2026, 1, 10)),
+        interval("provider-a", "in_network", date(2026, 1, 5), date(2026, 1, 20)),
+        interval("provider-a", "out_of_network", date(2026, 1, 10)),
+        interval("provider-b", "in_network", date(2026, 1, 1)),
+        interval("provider-b", "out_of_network", date(2027, 1, 1)),
+    ]
+    assert _conflicting_roster_rows(rows) == [2, 3, 4, 5, 6]
+    assert _conflicting_roster_entries([rows[2], rows[4]], [rows[0], rows[3]]) == [2, 3]
+
+    large_rows = [interval("provider-large", "in_network" if index % 2 else "out_of_network",
+                           date(2000, 1, 1) + timedelta(days=index),
+                           date(2000, 1, 1) + timedelta(days=index))
+                  for index in range(5000)]
+    started = perf_counter()
+    assert _conflicting_roster_rows(large_rows) == []
+    assert _conflicting_roster_entries(large_rows, large_rows) == []
+    assert perf_counter() - started < 3.0
+
+
+@pytest.mark.django_db
+def test_a11_strict_summary_csv_rejects_malformed_and_invalid_utf8_but_accepts_valid(client):
+    import hashlib
+    import json
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from pricing.models import ClaimsSummaryImport, Plan, PlanOrganization
+    from pricing.plan_audit_imports import APPROVED_FIELDS
+
+    organization = PlanOrganization.objects.create(
+        organization_name="A11 CSV Validation Test", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="CSV Plan",
+                               plan_reference="A11-CSV-PLAN")
+    period = "2026-01-01/2026-12-31"
+    header = ",".join(APPROVED_FIELDS)
+    valid_row = ("A11-CSV-PLAN,J9271,1000000004,2026Q1,outpatient_hospital,1,10,10,11-50,"
+                 f"{period},2026-01-01T00:00:00+00:00,1.0")
+
+    def submit(content, filename="claims_summary.csv"):
+        manifest = {
+            "file": filename, "sha256": hashlib.sha256(content).hexdigest(),
+            "raw_claims_included": False, "member_identifiers_included": False,
+            "small_cell_suppression_threshold": 11,
+            "complementary_suppression_applied": True,
+            "schema_version": "1.0", "approved_fields": APPROVED_FIELDS,
+            "aggregate_rows": 1,
+            "source_provenance": {"source_sha256": "a" * 64, "source_format": "csv",
+                "input_records": 1, "plan_reference": plan.plan_reference,
+                "source_period": period},
+        }
+        return client.post("/api/v1/plan-audits/import-summary/", {
+            "organization_id": organization.pk, "plan_id": plan.pk,
+            "file": SimpleUploadedFile(filename, content, content_type="text/csv"),
+            "manifest": SimpleUploadedFile("manifest.json", json.dumps(manifest).encode("utf-8"),
+                                            content_type="application/json"),
+        })
+
+    accepted = submit(f"{header}\n{valid_row}\n".encode())
+    assert accepted.status_code == 201, accepted.content
+    malformed = submit(f'{header}\n"A11-CSV-PLAN,J9271,1000000002'.encode())
+    assert malformed.status_code == 400
+    assert any("Malformed CSV syntax" in error["reason"]
+               for error in malformed.json()["validation_summary"]["errors"])
+    invalid_utf8 = submit(b"\xff\xfe\xfa")
+    assert invalid_utf8.status_code == 400
+    assert invalid_utf8.json()["import_status"] == "rejected"
+    assert ClaimsSummaryImport.objects.filter(plan=plan, import_status="rejected").count() == 2
+
+
+@pytest.mark.django_db
+def test_mk25_paginated_serializers_check_client_visibility_once(client, monkeypatch):
+    from types import SimpleNamespace
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+    from rest_framework.test import APIRequestFactory, force_authenticate
+    from pricing.permissions import APPLICATION_ROLES
+    from pricing import plan_audit_run
+
+    class Rows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def exclude(self, **kwargs):
+            return self
+
+        def order_by(self, *fields):
+            return self
+
+        def count(self):
+            return len(self.rows)
+
+        def __getitem__(self, item):
+            return self.rows[item]
+
+    factory = APIRequestFactory()
+    audit = SimpleNamespace(pk=1)
+    monkeypatch.setattr(plan_audit_run, "get_visible_audit", lambda user, audit_id: audit)
+    monkeypatch.setattr(plan_audit_run, "current_audit_run", lambda _audit: object())
+    monkeypatch.setattr(plan_audit_run, "run_results", lambda _run: active_rows[0])
+
+    for role in APPLICATION_ROLES:
+        user = get_user_model().objects.create_user(
+            username=f"mk25-{role.lower()}", password="test-only-password")
+        user.groups.add(Group.objects.get_or_create(name=role)[0])
+        client_only = role == "CLIENT"
+        checks = []
+        monkeypatch.setattr(plan_audit_run, "is_client_only",
+                            lambda _user, value=client_only: checks.append(value) or value)
+        for endpoint, route_name, values in (
+            (plan_audit_run.hospital_comparison, "hospital-comparison", {
+                "hospital_price_per_unit": "12", "hospital_markup_multiple": "2",
+                "plan_to_hospital_price_multiple": "1.5",
+            }),
+            (plan_audit_run.asp_benchmark, "asp-benchmark", {
+                "asp_payment_limit": "6", "allowed_markup_multiple": "2",
+                "paid_markup_multiple": "1.5",
+            }),
+        ):
+            query_counts = []
+            for size in (1, 50):
+                checks.clear()
+                row = SimpleNamespace(
+                    hcpcs_code="J1234", site_npi="1000000001", quarter="2026Q1",
+                    service_setting="outpatient", plan_allowed_price_per_unit="12",
+                    plan_paid_price_per_unit="9", data_quality_status="VALID",
+                    source_references={"private": "synthetic"}, **values)
+                active_rows = [Rows([row] * size)]
+                request = factory.get(f"/api/v1/plan-audits/1/{route_name}/")
+                force_authenticate(request, user=user)
+                with CaptureQueriesContext(connection) as queries:
+                    response = endpoint(request, audit_id=1)
+                query_counts.append(len(queries))
+                assert response.status_code == 200, (role, endpoint.__name__, response.data)
+                assert len(checks) == 1
+                result = response.data["results"][0]
+                assert ("source_references" in result) is (not client_only)
+            assert query_counts[0] == query_counts[1]
+
+
+@pytest.mark.django_db
+def test_mk28_client_market_exports_are_limited_to_released_canonical_csv(client, monkeypatch):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from rest_framework.test import APIRequestFactory
+    from pricing.permissions import APPLICATION_ROLES, CanAdminister
+    from pricing import views
+
+    release = {"drug_codes": ["J1234"]}
+    monkeypatch.setattr(views, "_comparison_column_names", lambda: set(views.RATE_COLUMNS))
+    factory = APIRequestFactory()
+
+    for role in APPLICATION_ROLES:
+        user = get_user_model().objects.create_user(
+            username=f"mk28-{role.lower()}", password="test-only-password")
+        user.groups.add(Group.objects.get_or_create(name=role)[0])
+        monkeypatch.setattr(views, "_viewer_release_payload",
+                            lambda _request, client=(role == "CLIENT"):
+                            (release, None) if client else (None, None))
+
+        def authorized(path):
+            request = factory.get(path)
+            request.user = user
+            return views._authorized_rate_filters(request)[3]
+
+        legacy = authorized("/api/v1/comparisons.csv")
+        modern = authorized("/api/v1/hospital-drug-price-comparisons/exports/csv/")
+        if role == "CLIENT":
+            assert legacy.status_code == 403
+            assert isinstance(modern, list)
+            assert not {"source_file", "source_member", "source_sha256"}.intersection(modern)
+        else:
+            assert isinstance(legacy, list)
+            assert isinstance(modern, list)
+
+        xlsx_request = factory.get("/api/v1/hospital-drug-price-comparisons/exports/excel/")
+        xlsx_request.user = user
+        assert CanAdminister().has_permission(xlsx_request, None) is (role == "SUPER_ADMIN")
 
 
 @pytest.mark.django_db
@@ -962,6 +1310,360 @@ def test_organization_and_plan_lifecycle(client):
 
 
 @pytest.mark.django_db
+def test_super_admin_status_management_preserves_history_and_blocks_inactive_org_access(client):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from django.test import Client as DjangoClient
+    from pricing.models import (AuditEvent, ClaimsSummaryImport, Plan, PlanAudit,
+                                PlanOrganization, PlanOrganizationAccess)
+
+    organization = PlanOrganization.objects.create(
+        organization_name="Status Management Test", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="Status Plan",
+                               plan_reference="STATUS-PLAN")
+    summary_import = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="aggregate.csv",
+        file_hash="a" * 64, schema_version="1.0", import_status="accepted")
+    audit = PlanAudit.objects.create(organization=organization, plan=plan,
+        summary_import=summary_import, audit_name="History remains", reporting_period="2026Q4")
+
+    ordinary_clients = []
+    for role in ("ANALYST", "REVIEWER", "CLIENT"):
+        user = get_user_model().objects.create_user(username=f"status-{role.lower()}", password="test")
+        role_group, _ = Group.objects.get_or_create(name=role)
+        user.groups.add(role_group)
+        PlanOrganizationAccess.objects.create(organization=organization, user=user)
+        ordinary_clients.append(mfa_force_login(DjangoClient(), user))
+
+    organization_update = client.patch(
+        f"/api/v1/organizations/{organization.pk}/status/", {"status": "inactive"},
+        content_type="application/json")
+    assert organization_update.status_code == 200, organization_update.content
+    assert organization_update.json()["status"] == "inactive"
+    assert organization.pk in [row["id"] for row in client.get("/api/v1/organizations/").json()]
+    assert plan.pk in [row["id"] for row in client.get("/api/v1/plans/").json()]
+
+    for role_client in ordinary_clients:
+        for path in (f"/api/v1/plans/{plan.pk}/",
+                     f"/api/v1/plan-audits/imports/{summary_import.pk}/",
+                     f"/api/v1/plan-audits/{audit.pk}/"):
+            assert role_client.get(path).status_code in {403, 404}
+
+    denied = ordinary_clients[0].patch(
+        f"/api/v1/organizations/{organization.pk}/status/", {"status": "active"},
+        content_type="application/json")
+    assert denied.status_code == 403
+    invalid = client.patch(
+        f"/api/v1/organizations/{organization.pk}/status/", {"status": "unknown"},
+        content_type="application/json")
+    assert invalid.status_code == 400
+
+    plan_deactivation = client.patch(
+        f"/api/v1/plans/{plan.pk}/", {"status": "inactive"}, content_type="application/json")
+    assert plan_deactivation.status_code == 200
+    plan_reactivation = client.patch(
+        f"/api/v1/plans/{plan.pk}/", {"status": "active"}, content_type="application/json")
+    assert plan_reactivation.status_code == 400
+    assert Plan.objects.get(pk=plan.pk).status == "inactive"
+
+    reactivated = client.patch(
+        f"/api/v1/organizations/{organization.pk}/status/", {"status": "active"},
+        content_type="application/json")
+    assert reactivated.status_code == 200
+    plan_reactivated = client.patch(
+        f"/api/v1/plans/{plan.pk}/", {"status": "active"}, content_type="application/json")
+    assert plan_reactivated.status_code == 200
+    assert all(role_client.get(f"/api/v1/plans/{plan.pk}/").status_code == 200
+               for role_client in ordinary_clients)
+    assert PlanAudit.objects.filter(pk=audit.pk).exists()
+    assert ClaimsSummaryImport.objects.filter(pk=summary_import.pk).exists()
+    status_events = AuditEvent.objects.filter(action__in=(
+        "plan_organization_status_changed", "plan_status_changed"))
+    assert status_events.count() == 4
+    assert all("previous_status" in event.details and "new_status" in event.details
+               and "timestamp" in event.details for event in status_events)
+
+
+@pytest.mark.django_db
+def test_a05_rejected_import_hash_can_be_retried_but_accepted_hash_is_unique():
+    from django.db import IntegrityError, transaction
+    from pricing.models import ClaimsSummaryImport, Plan, PlanOrganization
+
+    organization = PlanOrganization.objects.create(
+        organization_name="A05 Retry Test", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="A05 Plan",
+                               plan_reference="A05-RETRY-PLAN")
+    digest = "a" * 64
+    rejected = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="retry.csv",
+        file_hash=digest, schema_version="1.0", import_status="rejected")
+
+    accepted = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="retry.csv",
+        file_hash=digest, schema_version="1.0", import_status="accepted")
+    assert ClaimsSummaryImport.objects.filter(pk=rejected.pk, import_status="rejected").exists()
+    assert ClaimsSummaryImport.objects.filter(pk=accepted.pk, import_status="accepted").exists()
+    with pytest.raises(IntegrityError), transaction.atomic():
+        ClaimsSummaryImport.objects.create(
+            organization=organization, plan=plan, source_file_name="duplicate.csv",
+            file_hash=digest, schema_version="1.0", import_status="accepted")
+
+
+@pytest.mark.django_db
+def test_a08_expired_run_lease_recovers_and_live_lease_blocks_new_run(client, monkeypatch):
+    from datetime import timedelta
+    from django.contrib.auth import get_user_model
+    from django.conf import settings
+    from django.utils import timezone
+    from pricing.models import (ClaimsSummaryImport, Plan, PlanAudit, PlanAuditRun,
+                                PlanOrganization)
+    from pricing import plan_audit_run
+
+    organization = PlanOrganization.objects.create(
+        organization_name="A08 Recovery Test", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="A08 Plan",
+                               plan_reference="A08-RECOVERY-PLAN")
+    summary_import = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="a08.csv",
+        file_hash="a08" * 21 + "a", schema_version="1.0", import_status="accepted")
+    audit = PlanAudit.objects.create(organization=organization, plan=plan,
+        summary_import=summary_import, audit_name="Recovery", reporting_period="2026Q4",
+        status="running", current_version=1)
+    now = timezone.now()
+    run = PlanAuditRun.objects.create(
+        plan_audit=audit, version=1, calculation_status="running",
+        publication_status="pending", summary_import=summary_import,
+        started_at=now, heartbeat_at=now, worker_id="active-worker")
+    monkeypatch.setattr(plan_audit_run, "run_plan_audit", lambda *_args, **_kwargs: {
+        "quality_status_counts": {}, "result_rows": 0, "savings_opportunities": 0,
+    })
+    monkeypatch.setattr(settings, "PLAN_AUDIT_RUN_LEASE_SECONDS", 30, raising=False)
+
+    in_progress = client.post(f"/api/v1/plan-audits/{audit.pk}/run/")
+    assert in_progress.status_code == 409
+    run.refresh_from_db()
+    assert run.calculation_status == "running"
+
+    run.heartbeat_at = now - timedelta(seconds=31)
+    run.save(update_fields=["heartbeat_at"])
+    recovered = client.post(f"/api/v1/plan-audits/{audit.pk}/run/")
+    assert recovered.status_code == 200, recovered.content
+    run.refresh_from_db()
+    audit.refresh_from_db()
+    assert run.calculation_status == "failed"
+    assert run.publication_status == "failed"
+    assert audit.current_version == 2
+    assert PlanAuditRun.objects.filter(plan_audit=audit, version=2,
+                                       calculation_status="completed").exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a08_simultaneous_run_requests_allow_only_one_active_worker(client, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    import sqlite3
+    from django.contrib.auth import get_user_model
+    from django.conf import settings
+    from django.db import close_old_connections, connection
+    from django.test import Client as DjangoClient
+    from pricing.models import ClaimsSummaryImport, Plan, PlanAudit, PlanAuditRun, PlanOrganization
+
+    organization = PlanOrganization.objects.create(
+        organization_name="A08 Concurrency Test", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="Concurrent Plan",
+                               plan_reference="A08-CONCURRENCY-PLAN")
+    summary_import = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="concurrent.csv",
+        file_hash="c08" * 21 + "c", schema_version="1.0", import_status="accepted")
+    audit = PlanAudit.objects.create(organization=organization, plan=plan,
+        summary_import=summary_import, audit_name="Concurrent", reporting_period="2026Q4")
+    user = get_user_model().objects.get(is_superuser=True)
+    first_client = mfa_force_login(DjangoClient(), user)
+    second_client = mfa_force_login(DjangoClient(), user)
+    started, release = Event(), Event()
+
+    def paused_calculation(_audit, run, heartbeat=None):
+        assert not connection.in_atomic_block
+        heartbeat()
+        independent = sqlite3.connect(settings.DATABASES["default"]["NAME"])
+        try:
+            visible = independent.execute(
+                "SELECT heartbeat_at FROM pricing_planauditrun WHERE id = ?", [run.pk]).fetchone()
+        finally:
+            independent.close()
+        assert visible and visible[0]
+        started.set()
+        if not release.wait(10):
+            raise TimeoutError("The concurrency fixture was not released.")
+        return {"quality_status_counts": {}, "result_rows": 0, "savings_opportunities": 0}
+
+    monkeypatch.setattr("pricing.plan_audit_run.run_plan_audit", paused_calculation)
+
+    def first_request():
+        close_old_connections()
+        try:
+            return first_client.post(
+                f"/api/v1/plan-audits/{audit.pk}/run/").status_code
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(first_request)
+        assert started.wait(10), "The first run did not reach its calculation phase."
+        second_response = second_client.post(
+            f"/api/v1/plan-audits/{audit.pk}/run/")
+        release.set()
+        first_status = first.result(timeout=15)
+
+    assert first_status == 200
+    assert second_response.status_code == 409
+    assert PlanAuditRun.objects.filter(plan_audit=audit, calculation_status="running").count() == 0
+    assert PlanAuditRun.objects.filter(plan_audit=audit).count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a08_simultaneous_start_race_preserves_the_winning_run(client, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Event
+    from django.contrib.auth import get_user_model
+    from django.db import close_old_connections, connection
+    from django.test import Client as DjangoClient
+    from pricing.models import ClaimsSummaryImport, Plan, PlanAudit, PlanAuditRun, PlanOrganization
+
+    organization = PlanOrganization.objects.create(
+        organization_name="A08 Start Race Test", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="Start Race Plan",
+                               plan_reference="A08-START-RACE-PLAN")
+    summary_import = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="start-race.csv",
+        file_hash="d08" * 21 + "d", schema_version="1.0", import_status="accepted")
+    audit = PlanAudit.objects.create(organization=organization, plan=plan,
+        summary_import=summary_import, audit_name="Start race", reporting_period="2026Q4")
+    user = get_user_model().objects.get(is_superuser=True)
+    clients = [mfa_force_login(DjangoClient(), user) for _ in range(2)]
+    ready, started, release = Barrier(2), Event(), Event()
+
+    def paused_calculation(*_args, **_kwargs):
+        started.set()
+        if not release.wait(10):
+            raise TimeoutError("The concurrent start fixture was not released.")
+        return {"quality_status_counts": {}, "result_rows": 0, "savings_opportunities": 0}
+
+    monkeypatch.setattr("pricing.plan_audit_run.run_plan_audit", paused_calculation)
+
+    def run_request(test_client):
+        close_old_connections()
+        try:
+            ready.wait(timeout=10)
+            return test_client.post(f"/api/v1/plan-audits/{audit.pk}/run/").status_code
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(run_request, item) for item in clients]
+        # Keep the winning calculation active while its competitor attempts reservation.
+        assert started.wait(10), "The winning request did not reach its calculation phase."
+        release.set()
+        responses = sorted(future.result(timeout=20) for future in futures)
+
+    audit.refresh_from_db()
+    assert audit.status in {"completed", "needs_review"}, (
+        f"A losing concurrent start must not mark the audit failed; got {audit.status!r}."
+    )
+    assert responses == [200, 409]
+    assert PlanAuditRun.objects.filter(plan_audit=audit, calculation_status="completed").count() == 1
+    assert PlanAuditRun.objects.filter(plan_audit=audit, calculation_status="running").count() == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a08_stale_worker_cannot_complete_or_fail_after_owner_changes(client, monkeypatch):
+    from django.contrib.auth import get_user_model
+    from django.db import close_old_connections, connection
+    from django.test import Client as DjangoClient
+    from pricing.models import ClaimsSummaryImport, Plan, PlanAudit, PlanAuditRun, PlanOrganization
+
+    organization = PlanOrganization.objects.create(
+        organization_name="A08 Stale Owner Test", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="Stale Owner Plan",
+                               plan_reference="A08-STALE-OWNER-PLAN")
+    summary_import = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="stale-owner.csv",
+        file_hash="e08" * 21 + "e", schema_version="1.0", import_status="accepted")
+    audit = PlanAudit.objects.create(organization=organization, plan=plan,
+        summary_import=summary_import, audit_name="Stale owner", reporting_period="2026Q4")
+    user = get_user_model().objects.get(is_superuser=True)
+    from pricing import plan_audit_run
+
+    def lose_owner(_audit, _run, heartbeat=None):
+        PlanAudit.objects.filter(pk=audit.pk).update(run_owner_token="replacement-owner")
+        heartbeat()
+
+    monkeypatch.setattr(plan_audit_run, "run_plan_audit", lose_owner)
+    response = mfa_force_login(DjangoClient(), user).post(f"/api/v1/plan-audits/{audit.pk}/run/")
+    audit.refresh_from_db()
+    run = PlanAuditRun.objects.get(plan_audit=audit)
+    assert response.status_code == 409
+    assert audit.run_owner_token == "replacement-owner"
+    assert run.calculation_status == "running"
+    assert run.publication_status == "pending"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a08_concurrent_failure_is_recorded_only_by_the_owner(client, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from django.contrib.auth import get_user_model
+    from django.db import close_old_connections
+    from django.test import Client as DjangoClient
+    from pricing.models import (AuditEvent, ClaimsSummaryImport, Plan, PlanAudit,
+                                PlanAuditRun, PlanOrganization)
+
+    organization = PlanOrganization.objects.create(
+        organization_name="A08 Failure Race Test", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="Failure Race Plan",
+                               plan_reference="A08-FAILURE-RACE-PLAN")
+    summary_import = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="failure-race.csv",
+        file_hash="f08" * 21 + "f", schema_version="1.0", import_status="accepted")
+    audit = PlanAudit.objects.create(organization=organization, plan=plan,
+        summary_import=summary_import, audit_name="Failure race", reporting_period="2026Q4")
+    user = get_user_model().objects.get(is_superuser=True)
+    first_client, second_client = [mfa_force_login(DjangoClient(), user) for _ in range(2)]
+    started, release = Event(), Event()
+
+    def failing_calculation(*_args, **_kwargs):
+        started.set()
+        if not release.wait(10):
+            raise TimeoutError("The concurrent failure fixture was not released.")
+        raise RuntimeError("controlled concurrent failure")
+
+    monkeypatch.setattr("pricing.plan_audit_run.run_plan_audit", failing_calculation)
+
+    def first_request():
+        close_old_connections()
+        try:
+            return first_client.post(f"/api/v1/plan-audits/{audit.pk}/run/").status_code
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(first_request)
+        assert started.wait(10), "The first run did not reach its calculation phase."
+        competing_status = second_client.post(f"/api/v1/plan-audits/{audit.pk}/run/").status_code
+        release.set()
+        first_status = first.result(timeout=15)
+
+    audit.refresh_from_db()
+    run = PlanAuditRun.objects.get(plan_audit=audit)
+    assert (first_status, competing_status) == (500, 409)
+    assert audit.status == "failed"
+    assert not audit.run_owner_token
+    assert run.calculation_status == "failed"
+    assert run.publication_status == "failed"
+    assert AuditEvent.objects.filter(action="plan_audit_run_failed", entity_id=str(audit.pk)).count() == 1
+
+
+@pytest.mark.django_db
 def test_admin_account_role_and_organization_access_workflow(client):
     """Exercise the Admin UI's account and tenant-access API contracts together."""
     from django.contrib.auth import get_user_model
@@ -1412,7 +2114,7 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     assert not is_client_only(rev_user)
     superuser_audits = client.get("/api/v1/plan-audits/")
     assert superuser_audits.status_code == 200
-    assert any(row["id"] == audit_id for row in superuser_audits.json())
+    assert any(row["id"] == audit_id for row in superuser_audits.json()["results"])
     superuser_draft = client.get(f"/api/v1/plan-audits/{audit_id}/")
     assert superuser_draft.status_code == 200
     assert superuser_draft.json()["status"] == "draft"
@@ -1425,7 +2127,7 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
 
     client_drafts = client_test_client.get("/api/v1/plan-audits/")
     assert client_drafts.status_code == 200
-    client_draft = next(row for row in client_drafts.json() if row["id"] == audit_id)
+    client_draft = next(row for row in client_drafts.json()["results"] if row["id"] == audit_id)
     assert client_draft["can_view_results"] is False
     assert client_draft["summary"] == {}
     assert client_draft["result_fingerprint"] is None
@@ -1436,7 +2138,8 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
         assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/{suffix}").status_code == 404
     assert client_test_client.post(f"/api/v1/plan-audits/{audit_id}/run/").status_code == 403
     assert rev_client.get(f"/api/v1/plan-audits/{audit_id}/").status_code == 200
-    assert any(row["id"] == audit_id for row in rev_client.get("/api/v1/plan-audits/").json())
+    assert any(row["id"] == audit_id for row in
+               rev_client.get("/api/v1/plan-audits/").json()["results"])
     assert rev_client.post(f"/api/v1/plan-audits/{audit_id}/run/").status_code == 403
 
     # 6. Run Plan Audit
@@ -1482,7 +2185,13 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     run_obj = current_audit_run(audit_obj)
     unresolved_binding = {"version": run_obj.version,
                           "result_fingerprint": run_result_fingerprint(run_obj)}
-    assert client.post(f"/api/v1/plan-audits/{audit_id}/generate-report/").status_code == 200
+    report_response = client.post(f"/api/v1/plan-audits/{audit_id}/generate-report/")
+    assert report_response.status_code == 200
+    run_obj.refresh_from_db()
+    audit_obj.refresh_from_db()
+    assert report_response.json()["report_fingerprint"] == run_obj.report_fingerprint
+    from django.utils.dateparse import parse_datetime
+    assert parse_datetime(report_response.json()["report_generated_at"]) == audit_obj.report_generated_at
     unresolved_approval = rev_client.post(f"/api/v1/plan-audits/{audit_id}/approve/",
         {"comments": "Unresolved fixture must not publish.", **unresolved_binding},
         content_type="application/json")
@@ -1526,8 +2235,8 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     from pricing import plan_audit_run
     original_engine = plan_audit_run.run_plan_audit
 
-    def validated_fixture_engine(audit, active_run):
-        summary = original_engine(audit, active_run)
+    def validated_fixture_engine(audit, active_run, heartbeat=None):
+        summary = original_engine(audit, active_run, heartbeat=heartbeat)
         for row in PlanAuditResult.objects.filter(audit_run=active_run):
             refs = dict(row.source_references)
             refs["unit_review_status"] = "validated"
@@ -1811,7 +2520,7 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     # Currently approved -> Client sees audit
     client_audits_res = client_test_client.get("/api/v1/plan-audits/")
     assert client_audits_res.status_code == 200
-    assert any(a["id"] == audit_id for a in client_audits_res.json())
+    assert any(a["id"] == audit_id for a in client_audits_res.json()["results"])
 
     client_report_res = client_test_client.get(f"/api/v1/plan-audits/{audit_id}/report/")
     assert client_report_res.status_code == 200
@@ -1849,7 +2558,7 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
 
     # Client user can no longer view or download rejected audit
     client_audits_after = client_test_client.get("/api/v1/plan-audits/")
-    pending = next(a for a in client_audits_after.json() if a["id"] == audit_id)
+    pending = next(a for a in client_audits_after.json()["results"] if a["id"] == audit_id)
     assert pending["publication_status"] == "rejected"
     assert pending["can_view_results"] is False
     assert pending["summary"] == {}
@@ -1879,7 +2588,7 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     }, content_type="application/json")
     assert stale_rejection.status_code == 409
     listed = client_test_client.get("/api/v1/plan-audits/").json()
-    assert next(item for item in listed if item["id"] == audit_id)["publication_status"] != "published"
+    assert next(item for item in listed["results"] if item["id"] == audit_id)["publication_status"] != "published"
     for suffix in ("overview/", "results/", "report/", "export-csv/", "savings/", "quality/"):
         assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/{suffix}").status_code == 404
     audit_obj.refresh_from_db()
@@ -1896,7 +2605,7 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     assert reapproval.json()["version"] == 3
     client_list = client_test_client.get("/api/v1/plan-audits/")
     assert client_list.status_code == 200
-    client_metadata = next(item for item in client_list.json() if item["id"] == audit_id)
+    client_metadata = next(item for item in client_list.json()["results"] if item["id"] == audit_id)
     assert client_metadata["summary_import_id"] is None
     assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/overview/").status_code == 200
     client_results = client_test_client.get(f"/api/v1/plan-audits/{audit_id}/results/")
@@ -1964,7 +2673,8 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     unassigned_client = DjangoClient()
     mfa_force_login(unassigned_client, unassigned_client_user)
     assert unassigned_client.get(f"/api/v1/plan-audits/{audit_id}/").status_code == 404
-    assert not any(item["id"] == audit_id for item in unassigned_client.get("/api/v1/plan-audits/").json())
+    assert not any(item["id"] == audit_id for item in
+                   unassigned_client.get("/api/v1/plan-audits/").json()["results"])
     mixed_client_analyst = get_user_model().objects.create_user(
         username="mk05-mixed-unassigned-analyst", password="test-password")
     mixed_client_analyst.groups.add(client_group, analyst_group)
@@ -1973,7 +2683,8 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     mixed_client_analyst_client = DjangoClient()
     mfa_force_login(mixed_client_analyst_client, mixed_client_analyst)
     assert mixed_client_analyst_client.get(f"/api/v1/plan-audits/{audit_id}/").status_code == 404
-    assert not any(item["id"] == audit_id for item in mixed_client_analyst_client.get("/api/v1/plan-audits/").json())
+    assert not any(item["id"] == audit_id for item in
+                   mixed_client_analyst_client.get("/api/v1/plan-audits/").json()["results"])
 
     # Independent MK-03 lifecycle with the requested exact v1 -> reject -> v2 sequence.
     monkeypatch.setattr(plan_audit_run, "run_plan_audit", validated_fixture_engine)
@@ -2033,7 +2744,7 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     for suffix in ("overview/", "results/", "report/", "export-csv/", "savings/", "quality/"):
         assert client_test_client.get(f"/api/v1/plan-audits/{lifecycle_id}/{suffix}").status_code == 404
     client_lifecycle_metadata = next(
-        item for item in client_test_client.get("/api/v1/plan-audits/").json()
+        item for item in client_test_client.get("/api/v1/plan-audits/").json()["results"]
         if item["id"] == lifecycle_id)
     assert client_lifecycle_metadata["publication_status"] == "rejected"
     assert client_lifecycle_metadata["summary"] == {}

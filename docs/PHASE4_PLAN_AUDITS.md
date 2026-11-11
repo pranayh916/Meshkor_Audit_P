@@ -81,10 +81,10 @@ hcpcs_billing_units:
     unit: "MG"
     verification_status: "validated"
     source_reference: "FDA Package Insert Rev 2024-01"
-    evidence_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    source_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 ```
 
-Every code requires `qty`, `unit`, `verification_status: validated`, `source_reference`, and the evidence file's 64-character SHA-256. There is no fallback or default billing unit. Codes without verified billing units will not produce exportable aggregates.
+Every code requires `qty`, `unit`, `verification_status: validated`, `source_reference`, and the source file's 64-character SHA-256 in `source_sha256`. There is no fallback or default billing unit. Codes without verified billing units will not produce exportable aggregates.
 
 ### 2.6 Privacy Suppression Rules
 - Aggregation is performed by `(plan_reference, hcpcs_code, site_npi, quarter, service_setting)`.

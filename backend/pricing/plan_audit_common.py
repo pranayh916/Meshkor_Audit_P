@@ -32,6 +32,7 @@ def get_visible_organization(user, organization_id):
 def get_visible_plan(user, plan_id):
     plans = Plan.objects.select_related("organization").filter(status="active")
     if not is_admin(user):
+        plans = plans.filter(organization__status="active")
         plans = plans.filter(organization__user_access__user=user).distinct()
     return get_object_or_404(plans, pk=plan_id)
 
@@ -39,7 +40,9 @@ def get_visible_plan(user, plan_id):
 def get_visible_import(user, import_id):
     imports = ClaimsSummaryImport.objects.select_related("organization", "plan")
     if not is_admin(user):
-        imports = imports.filter(organization__user_access__user=user).distinct()
+        imports = imports.filter(organization__status="active", plan__status="active",
+                                 plan__organization__status="active",
+                                 organization__user_access__user=user).distinct()
     return get_object_or_404(imports, pk=import_id)
 
 
@@ -59,7 +62,9 @@ def get_accessible_audit(user, audit_id):
         "organization", "plan", "summary_import"
     )
     if not is_admin(user):
-        audits = audits.filter(organization__user_access__user=user).distinct()
+        audits = audits.filter(organization__status="active", plan__status="active",
+                               plan__organization__status="active",
+                               organization__user_access__user=user).distinct()
     return get_object_or_404(audits, pk=audit_id)
 
 

@@ -32,6 +32,28 @@ APPROVED_FIELDS = [
 MAX_SUMMARY_BYTES = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_ROWS = 100_000
+LIST_PAGE_SIZE = 100
+
+
+def _list_page(request, queryset, serializer):
+    try:
+        page = int(request.query_params.get("page", "1"))
+        page_size = min(int(request.query_params.get("page_size", LIST_PAGE_SIZE)), 200)
+        if page < 1 or page_size < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response({"error": "page and page_size must be positive whole numbers."}, status=400)
+    count = queryset.count()
+    start = (page - 1) * page_size
+    page_count = (count + page_size - 1) // page_size
+    items = ([serializer(item) for item in queryset[start:start + page_size]]
+             if page <= page_count else [])
+    return Response({
+        "count": count, "page": page, "page_size": page_size,
+        "next": page + 1 if page < page_count else None,
+        "previous": page - 1 if page > 1 and page <= page_count + 1 else None,
+        "results": items,
+    })
 
 
 def _admin_required(request):
@@ -88,6 +110,13 @@ def _source_period(value):
     return start, end
 
 
+def _safe_summary_rows(reader):
+    try:
+        yield from reader
+    except csv.Error as exc:
+        yield {"__csv_parse_error__": str(exc)}
+
+
 def _validate_summary(content, plan, manifest):
     errors, rows, keys, periods = [], [], set(), set()
     provenance = manifest.get("source_provenance")
@@ -106,8 +135,12 @@ def _validate_summary(content, plan, manifest):
         text = content.decode("utf-8-sig")
     except UnicodeDecodeError:
         return [], 0, [{"row": 0, "reason": "CSV must use UTF-8 encoding."}], "", "unknown"
-    reader = csv.DictReader(io.StringIO(text, newline=""))
-    if reader.fieldnames != APPROVED_FIELDS:
+    reader = csv.DictReader(io.StringIO(text, newline=""), strict=True)
+    try:
+        fieldnames = reader.fieldnames
+    except csv.Error as exc:
+        return [], 0, [{"row": 1, "reason": f"Malformed CSV syntax: {exc}"}], "", "unknown"
+    if fieldnames != APPROVED_FIELDS:
         return [], 0, [{"row": 1, "reason": "CSV header does not exactly match the approved aggregate schema."}], "", "unknown"
     if (manifest.get("schema_version") != "1.0"
             or manifest.get("approved_fields") != APPROVED_FIELDS
@@ -119,7 +152,10 @@ def _validate_summary(content, plan, manifest):
         return [], 0, [{"row": 0, "reason": "Manifest schema or privacy/suppression declaration is invalid."}], "", "unknown"
 
     input_rows = 0
-    for line, row in enumerate(reader, start=2):
+    for line, row in enumerate(_safe_summary_rows(reader), start=2):
+        if "__csv_parse_error__" in row:
+            errors.append({"row": line, "reason": f"Malformed CSV syntax: {row['__csv_parse_error__']}"})
+            break
         input_rows += 1
         if input_rows > MAX_ROWS:
             errors.append({"row": line, "reason": "Aggregate file exceeds the 100,000 row limit."})
@@ -241,7 +277,7 @@ def import_plan_summary(request):
             or manifest.get("complementary_suppression_applied") is not True):
         return Response({"error": "Manifest integrity or privacy/suppression checks failed."}, status=400)
     filename = _filename(upload.name)
-    if ClaimsSummaryImport.objects.filter(plan=plan, file_hash=digest).exists():
+    if ClaimsSummaryImport.objects.filter(plan=plan, file_hash=digest, import_status="accepted").exists():
         return Response({"error": "This summary file has already been imported for the selected plan."}, status=409)
     rows, input_rows, errors, source_period, version = _validate_summary(content, plan, manifest)
     if errors:
@@ -290,23 +326,26 @@ def import_plan_summary(request):
 
 
 @api_view(["GET"])
-@permission_classes([CanView])
+@permission_classes([CanAnalyze])
 def plan_summary_imports(request):
     queryset = ClaimsSummaryImport.objects.select_related("organization", "plan").filter(
         organization__in=visible_organizations(request.user))
+    if not is_admin(request.user):
+        queryset = queryset.filter(plan__status="active", plan__organization__status="active")
     if request.query_params.get("plan_id"):
         queryset = queryset.filter(plan_id=request.query_params["plan_id"])
-    return Response([import_payload(item) for item in queryset[:200]])
+    queryset = queryset.order_by("-imported_at", "-pk")
+    return _list_page(request, queryset, import_payload)
 
 
 @api_view(["GET"])
-@permission_classes([CanView])
+@permission_classes([CanAnalyze])
 def plan_summary_import_detail(request, import_id):
     return Response(import_payload(get_visible_import(request.user, import_id)))
 
 
 @api_view(["GET"])
-@permission_classes([CanView])
+@permission_classes([CanAnalyze])
 def plan_summary_import_quality(request, import_id):
     item = get_visible_import(request.user, import_id)
     return Response({"import_id": item.pk, "file_hash": item.file_hash,
@@ -318,15 +357,16 @@ def plan_summary_import_quality(request, import_id):
 @permission_classes([CanView])
 def plan_audits(request):
     from .models import PlanAudit
-    from .plan_audit_common import audit_payload, is_client_only
+    from .plan_audit_common import audit_payload
     queryset = PlanAudit.objects.select_related(
         "organization", "plan", "summary_import", "created_by"
     ).filter(organization__in=visible_organizations(request.user))
-    if is_client_only(request.user):
-        queryset = queryset.filter(plan__status="active")
+    if not is_admin(request.user):
+        queryset = queryset.filter(plan__status="active", plan__organization__status="active")
     if request.query_params.get("plan_id"):
         queryset = queryset.filter(plan_id=request.query_params["plan_id"])
-    return Response([audit_payload(item, request.user) for item in queryset[:200]])
+    queryset = queryset.order_by("-created_at", "-pk")
+    return _list_page(request, queryset, lambda item: audit_payload(item, request.user))
 
 
 @api_view(["POST"])

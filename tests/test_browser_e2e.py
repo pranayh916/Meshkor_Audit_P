@@ -156,7 +156,8 @@ def _api(page, path, *, method="GET", body=None):
     }""", {"path": path, "method": method, "body": body})
 
 
-def _write_extract(tmp_path, plan_reference, hcpcs, site_specs, file_stem):
+def _write_extract(tmp_path, plan_reference, hcpcs, site_specs, file_stem,
+                   service_date="2026-10-15"):
     from client_extractor.src.cli import extract_claims
 
     source = tmp_path / f"{file_stem}-raw-synthetic.csv"
@@ -170,7 +171,7 @@ def _write_extract(tmp_path, plan_reference, hcpcs, site_specs, file_stem):
         for site_npi, allowed, paid in site_specs:
             for member_index in range(11):
                 serial += 1
-                writer.writerow({"claim_id": f"{file_stem}-{serial}", "service_date": "2026-10-15",
+                writer.writerow({"claim_id": f"{file_stem}-{serial}", "service_date": service_date,
                     "hcpcs_code": hcpcs, "site_npi": site_npi, "units": "1",
                     "allowed_amount": allowed, "paid_amount": paid,
                     "member_id": f"{file_stem}-member-{serial}", "claim_status": "paid",
@@ -304,7 +305,7 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
         assert admin_response.status == 200
         assert page.locator("#header").inner_text().startswith("Django administration")
         page.goto(origin + "/user-management")
-        page.get_by_role("main").get_by_role("heading", name="User management").wait_for()
+        page.get_by_role("main").get_by_role("heading", name="Application accounts").wait_for()
 
         analyst_name = f"rg01-analyst-{run_tag}"
         reviewer_a_name = f"rg01-reviewer-a-{run_tag}"
@@ -320,10 +321,10 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
         assert "REVIEWER" in db_call(lambda: list(reviewer_a_user.groups.values_list("name", flat=True)))
         assert "CLIENT" in db_call(lambda: list(client_user.groups.values_list("name", flat=True)))
         page.goto(origin + "/data-sources")
-        page.get_by_role("heading", name="Sources & uploads").wait_for()
+        page.get_by_role("heading", name="Add a source file").wait_for()
         assert _api(page, "/api/v1/data-sources/")["status"] == 200
         page.goto(origin + "/audit-logs")
-        page.get_by_role("heading", name="Audit logs").wait_for()
+        page.get_by_role("heading", name="Recent events").wait_for()
         assert _api(page, "/api/v1/audit-logs/")["status"] == 200
 
         page.goto(origin + "/plan-specific-audits")
@@ -371,7 +372,7 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
 
         # Clinical reviewer records a CMS-bound synthetic decision through the UI.
         reviewer_page.goto(origin + "/drug-unit-validations")
-        reviewer_page.get_by_role("heading", name="Unit validation", exact=True).wait_for()
+        reviewer_page.get_by_role("heading", name="CMS billing-unit review", exact=True).wait_for()
         drug_card = reviewer_page.locator("article.review-card").filter(has_text="J9271")
         drug_card.wait_for()
         drug_card.get_by_label("Review status for J9271").select_option("validated")
@@ -408,6 +409,21 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
         ], "main")
         analyst_page.get_by_role("tab", name="Plan Setup").click()
         _upload_summary(analyst_page, main_summary, main_manifest)
+        analyst_page.get_by_label("Audit name").wait_for()
+        assert analyst_page.get_by_label("Source period").input_value() == "2026-10-15/2026-10-15"
+        analyst_page.wait_for_load_state("networkidle")
+
+        second_summary, second_manifest = _write_extract(tmp_path, plan_reference, "J9271", [
+            ("1000000004", "140", "100"), ("1000000012", "10", "8"),
+        ], "secondary", service_date="2026-10-20")
+        _upload_summary(analyst_page, second_summary, second_manifest)
+        analyst_page.wait_for_load_state("networkidle")
+        analyst_imports = db_call(lambda: list(ClaimsSummaryImport.objects.filter(
+            organization_id=organization.pk, plan_id=plan.pk, import_status="accepted"
+        ).order_by("pk")))
+        assert len(analyst_imports) == 2
+        analyst_page.get_by_label("Summary import").select_option(str(analyst_imports[0].pk))
+        assert analyst_page.get_by_label("Source period").input_value() == "2026-10-15/2026-10-15"
 
         roster_path = tmp_path / "synthetic-network-roster.csv"
         with roster_path.open("w", newline="", encoding="utf-8") as stream:
@@ -419,7 +435,14 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
                              "2026-01-01", "2026-12-31", "Synthetic Location A", plan_reference])
             writer.writerow(["1000000012", "Synthetic Site B", "Synthetic Choice", "in_network",
                              "2026-01-01", "2026-12-31", "Synthetic Location B", plan_reference])
-        analyst_page.get_by_label("Network roster CSV").set_input_files(str(roster_path))
+        try:
+            analyst_page.get_by_label("Network roster CSV").set_input_files(str(roster_path))
+        except Exception:
+            print("Analyst roster form diagnostic:", analyst_page.url,
+                  analyst_page.locator("body").inner_text(timeout=2000)[:1600],
+                  "api_responses=", api_responses[-20:], "console_errors=", console_errors,
+                  "page_errors=", page_errors)
+            raise
         analyst_page.get_by_role("button", name="Validate and import roster").click()
         analyst_page.get_by_text("Network roster imported.").wait_for()
 
@@ -428,11 +451,42 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
         page.goto(origin + "/plan-specific-audits")
         page.get_by_role("heading", name="Plan-specific infusion drug audits").wait_for()
         page.get_by_role("tab", name="Plan Setup").click()
+        try:
+            page.get_by_label("Audit name").wait_for()
+        except Exception:
+            import_response = _api(page, "/api/v1/plan-audits/imports/?plan_id=" +
+                                   page.locator(".plan-audit-selectors select").nth(1).input_value())
+            import_payload = import_response.get("payload")
+            import_summary = {
+                "status": import_response.get("status"),
+                "shape": type(import_payload).__name__,
+                "items": ([{"id": item.get("id"), "organization_id": item.get("organization_id"),
+                            "plan_id": item.get("plan_id"), "import_status": item.get("import_status")}
+                           for item in import_payload if isinstance(item, dict)]
+                          if isinstance(import_payload, list) else None),
+            }
+            selectors = page.locator(".plan-audit-selectors select")
+            print("Admin plan setup diagnostic:", page.locator("main").inner_text(timeout=2000)[:1800],
+                  "roles=", page.locator(".account .muted").inner_text(),
+                  "selected_org_plan=", [selectors.nth(i).input_value()
+                                         for i in range(min(2, selectors.count()))],
+                  "summary_import_options=", page.locator('select[name="summary_import_id"] option').all_text_contents(),
+                  "imports=", import_summary, "api_responses=", api_responses[-20:],
+                  "console_errors=", console_errors, "page_errors=", page_errors)
+            raise
+        accepted_summaries = db_call(lambda: list(ClaimsSummaryImport.objects.filter(
+            organization_id=organization.pk, plan_id=plan.pk, import_status="accepted"
+        ).order_by("pk")))
+        assert len(accepted_summaries) == 2
+        page.get_by_label("Summary import").select_option(str(accepted_summaries[0].pk))
+        assert page.get_by_label("Source period").input_value() == "2026-10-15/2026-10-15"
         page.get_by_label("Audit name").fill("RG01 Eligible Synthetic Audit")
         page.get_by_label("Source period").fill("2026-10-15/2026-10-15")
         page.get_by_role("button", name="Create audit").click()
         page.get_by_text("Plan audit created.").wait_for()
         main_audit = db_call(PlanAudit.objects.get, audit_name="RG01 Eligible Synthetic Audit")
+        accepted_summary = accepted_summaries[0]
+        assert main_audit.summary_import_id == accepted_summary.pk
         page.get_by_role("button", name="Run audit").click()
         page.get_by_text("Audit run finished.", exact=False).wait_for()
         main_results = _api(page, f"/api/v1/plan-audits/{main_audit.pk}/results/")

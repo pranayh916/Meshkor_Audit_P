@@ -1,6 +1,6 @@
 # MeshKor Project Handoff
 
-## Current status and historical notes (2026-11-06)
+## Current status and historical notes (2026-11-07)
 
 This file contains dated implementation records, including earlier findings
 that were later fixed. When sections conflict, use the newest dated disposition
@@ -10,6 +10,98 @@ identified 23 findings. MK-01 through MK-23 have code/documentation changes
 recorded here or in the current README and extractor guide. Deployment,
 real-data, browser, and production-database checks are separate acceptance
 steps and must not be inferred from synthetic regression results.
+
+### MK-23 through MK-30 disposition (2026-11-07)
+
+This is the latest verified engineering status. Test counts in older dated
+sections, including 135 and 141, are historical snapshots and are not current
+baselines. The non-browser backend baseline is **148 passed** using pytest's
+disposable synthetic-data fixture and database. Real operational/reference
+files and customer databases were not changed. Browser and genuine
+clinical/business acceptance remain separate from this technical result.
+
+- **MK-23 — FIXED AND VERIFIED.** `excluded_records` remains a claim-record
+  count and aggregate-cell exclusions remain in `excluded_aggregate_cells`.
+  Complementary-suppression and record/cell regressions pass.
+- **MK-24 — FIXED AND VERIFIED.** The active branch has no unmerged index
+  entries, merge-in-progress state, or conflict markers in tracked application
+  source. No merge, reset, or index operation was performed. Pre-existing
+  deletions under tracked `tmp_pytest/` artifacts remain untouched.
+- **MK-25 — FIXED AND VERIFIED.** Both paginated serializers compute
+  Client-only status once per request and omit source references for Client-only
+  users. Captured SQL query counts for 1-row and 50-row pages are equal across
+  all four roles.
+- **MK-26 — FIXED AND VERIFIED.** Analyst reads and plan-level summary/roster
+  imports remain available. Platform source uploads and platform-wide
+  processing-job POSTs require Super Admin. Analyst reference, hospital catalog,
+  data-quality, and source-status pages are read-only in the UI; Reviewer and
+  Client import inventory access is denied. Direct API role regressions pass.
+- **MK-27 — FIXED AND VERIFIED for application tests.** Application tests use
+  disposable generated fixtures and do not depend on gitignored customer or
+  reference datasets. Genuine full-data integration was not run and remains a
+  separate data-acceptance requirement.
+- **MK-28 — FIXED AND VERIFIED.** Client market CSV downloads use the current
+  released payload and exclude source provenance. Legacy CSV aliases are
+  internal-only; XLSX remains Super Admin-only. Plan-specific downloads retain
+  current published-version authorization. Authorization regressions pass.
+- **MK-29 — FIXED AND VERIFIED.** General import list, detail, and quality
+  endpoints require Analyst or Super Admin. Reviewer review remains scoped to
+  review APIs; Reviewer and Client import inventory requests are denied.
+- **MK-30 — FIXED AND VERIFIED.** This section is the current dated status;
+  prior implementation records and historical failures are retained below.
+
+Technical tests do not grant clinical signoff or business acceptance. Clinical
+approval status remains **NOT PROVIDED**. Commercial release remains **NOT
+READY** until genuine data, clinical, business, security, and browser acceptance
+requirements pass.
+
+### Latest verification commands (2026-11-07)
+
+- `.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --ignore=tests/test_browser_e2e.py --basetemp=.pytest-tmp\mk30-final` — **148 passed in 24.67s**.
+- `.venv\Scripts\python.exe backend\manage.py check` — **passed**.
+- `.venv\Scripts\python.exe backend\manage.py makemigrations --check --dry-run` — **no changes detected**.
+- `.venv\Scripts\python.exe backend\manage.py migrate --check` — **passed**.
+- `npm --prefix frontend test` — **4 passed**.
+- `npm --prefix frontend run build` — **passed**.
+- `git diff --check` — **exit 0**; Git printed access warnings for pre-existing deletions under tracked `tmp_pytest/` paths. The scoped check over changed implementation, test, and handoff files was clean. The tracked application-source conflict-marker scan found no markers; `git ls-files -u` returned no entries.
+- Headless: `.venv\Scripts\python.exe -m pytest tests\test_browser_e2e.py -q -p no:cacheprovider --tb=short --basetemp=.pytest-tmp\mk30-headless-selection` with `MESHKOR_TEST_DB_PATH` set to `.pytest-tmp\mk30-browser-headless-selection.sqlite3` — **1 passed in 67.44s**.
+- Headed: `.venv\Scripts\python.exe -m pytest tests\test_browser_e2e.py -q -p no:cacheprovider --headed --slowmo=50 --tb=short --basetemp=.pytest-tmp\mk30-headed-selection` with `MESHKOR_TEST_DB_PATH` set to `.pytest-tmp\mk30-browser-headed-selection.sqlite3` — **1 passed in 73.46s**.
+- Genuine full-data acceptance was not run. Both browser attempts used disposable SQLite databases and synthetic fixtures; neither used operational/customer databases.
+
+### Browser audit-creation blocker closed (2026-11-07)
+
+**Disposition: FIXED AND VERIFIED.** The import API and its role policy were
+correct. `isReviewer(user)` intentionally returns true for Admins as well as
+Reviewers, but the Plan Audits loader used that predicate to skip the import
+request. Consequently, a Super Admin received `Promise.resolve([])` for
+imports even though their direct `GET /plan-audits/imports/?plan_id=…` returned
+the accepted synthetic row. The UI now loads imports for `analyst` capability
+(which includes Super Admin) and skips that endpoint for Reviewer-only users.
+
+The next browser render exposed a component-scope error: `acceptedImports` was
+derived in `PlanAudits` but referenced inside `PlanSetupSection` without being
+passed. `PlanSetupSection` now derives its accepted options from its scoped
+`imports` prop. Rejected imports are not offered in the selector, and the create
+request submits the selected accepted import ID. The backend already required
+an active, authorized organization and plan plus an `accepted` import; those
+checks and permissions did not change.
+
+- Admin and assigned Analyst import lists return only their visible
+  organization records; Reviewer and Client list requests return **403**.
+- Regression coverage verifies Analyst visibility excludes a foreign tenant,
+  audit creation succeeds with an accepted import, and rejected/foreign imports
+  fail with **400**. Reviewer and Client audit-creation requests return **403**.
+- Headless and headed browser runs each uploaded two valid synthetic summaries
+  through the Analyst UI with distinct source periods. In both roles, selecting
+  the other accepted import updated the audit form's source period. The
+  Admin-created audit references the selected import ID. Reviewer audit
+  selection completed without a general import-list request.
+- Latest non-browser backend suite: **148 passed in 24.67s**. Frontend role
+  tests: **4 passed**; React production build, Django checks, migration checks,
+  Python compilation, and changed-file `git diff --check` passed.
+
+This browser blocker has no remaining code or test blocker. Genuine full-data,
+clinical, and business acceptance remain separate release requirements.
 
 ### P3 closure — MK-22 and MK-23
 

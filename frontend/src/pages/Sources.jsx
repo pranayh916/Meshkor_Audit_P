@@ -1,13 +1,15 @@
 import { useEffect, useState } from "react";
 import { getJSON, postJSON, uploadSource, useApi, fmt } from "../api.js";
 import { fileName, Loading } from "../components.jsx";
+import { hasRole } from "../rolePolicy.js";
 
 function todayLocal() {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 }
 
-export default function Sources() {
+export default function Sources({ user }) {
+  const canManageSources = hasRole(user, "SUPER_ADMIN");
   const [version, setVersion] = useState(0);
   const [sourceKey, setSourceKey] = useState("");
   const [file, setFile] = useState(null);
@@ -60,8 +62,10 @@ export default function Sources() {
   }
 
   return <>
-    <p className="lede">Upload and import files to refresh the dashboard.</p>
-    <section>
+    <p className="lede">{canManageSources
+      ? "Upload and import platform source files to refresh the dashboard."
+      : "Review platform source availability and processing status."}</p>
+    {canManageSources && <section>
       <h2>Add a source file</h2>
       <form className="filters" onSubmit={submit}>
         <select aria-label="Input type" value={sourceKey} onChange={(e) => setSourceKey(e.target.value)} required>
@@ -89,7 +93,7 @@ export default function Sources() {
           {busy ? "Queueing…" : "Import data and rebuild dashboard"}
         </button>
       </div>}
-    </section>
+    </section>}
     {job && <section aria-live="polite">
       <h2>Import job {job.id}</h2>
       <p><b>{job.status}</b>{job.progress != null ? ` · ${job.progress}%` : ""}</p>
