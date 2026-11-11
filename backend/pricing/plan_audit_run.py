@@ -2,13 +2,20 @@
 import logging
 import hashlib
 import json
+import errno
+import os
+import threading
+import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 
-from django.db import transaction
+from django.db import connection, transaction
+from django.db.models import Q
 from django.utils import timezone
 from django.conf import settings
+from datetime import timedelta
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
@@ -29,6 +36,115 @@ _ALLOWED_SORT_FIELDS = frozenset([
 _ALLOWED_FILTER_FIELDS = frozenset([
     "hcpcs_code", "quarter", "site_npi", "service_setting", "data_quality_status",
 ])
+
+_LOCAL_AUDIT_LOCKS = {}
+_LOCAL_AUDIT_LOCKS_GUARD = threading.Lock()
+
+
+class RunOwnershipLost(Exception):
+    """The execution token no longer owns the audit's current run."""
+
+
+@contextmanager
+def _audit_execution_lock(audit_id):
+    """Acquire a process-lifetime lock for one audit execution.
+
+    PostgreSQL advisory locks coordinate all app hosts using the same cluster.
+    SQLite file locks coordinate processes sharing the same local filesystem;
+    SQLite deployments across hosts or filesystems without reliable OS locking
+    must use a single application host for audit execution.
+    """
+    if connection.vendor == "postgresql":
+        lock_key = int.from_bytes(hashlib.sha256(
+            f"plan-audit-run:{audit_id}".encode("ascii")).digest()[:8], "big", signed=True)
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_try_advisory_lock(%s)", [lock_key])
+            acquired = cursor.fetchone()[0]
+        try:
+            yield acquired
+        finally:
+            if acquired and connection.is_usable():
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_advisory_unlock(%s)", [lock_key])
+        return
+
+    if connection.vendor == "sqlite":
+        database_name = str(connection.settings_dict["NAME"])
+        if database_name == ":memory:" or "mode=memory" in database_name:
+            lock_key = (os.getpid(), audit_id)
+            with _LOCAL_AUDIT_LOCKS_GUARD:
+                lock = _LOCAL_AUDIT_LOCKS.setdefault(lock_key, threading.Lock())
+            acquired = lock.acquire(blocking=False)
+            try:
+                yield acquired
+            finally:
+                if acquired:
+                    lock.release()
+            return
+
+        database_path = Path(database_name).resolve()
+        lock_path = database_path.with_name(f"{database_path.name}.audit-run-{audit_id}.lock")
+        with lock_path.open("a+b") as lock_file:
+            if os.name == "nt":
+                import msvcrt
+                lock_file.seek(0, os.SEEK_END)
+                if lock_file.tell() == 0:
+                    lock_file.write(b"\0")
+                    lock_file.flush()
+                lock_file.seek(0)
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EDEADLOCK, errno.EAGAIN}:
+                        raise
+                    yield False
+                    return
+                try:
+                    yield True
+                finally:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    yield False
+                    return
+                try:
+                    yield True
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        return
+
+    raise RuntimeError("Plan audit execution locking is supported only on SQLite and PostgreSQL.")
+
+
+def _fail_owned_run(audit, run, worker_id, actor):
+    if not run:
+        PlanAudit.objects.filter(pk=audit.pk, run_owner_token=worker_id).update(run_owner_token="")
+        return False
+    now = timezone.now()
+    with transaction.atomic():
+        changed = PlanAuditRun.objects.filter(
+            pk=run.pk, calculation_status="running", worker_id=worker_id,
+            plan_audit__run_owner_token=worker_id,
+        ).update(calculation_status="failed", publication_status="failed", completed_at=now)
+        if not changed:
+            return False
+        audit_changed = PlanAudit.objects.filter(
+            pk=audit.pk, current_version=run.version, run_owner_token=worker_id,
+        ).update(status="failed", summary={
+            "error": "Audit execution failed; this result version was not completed.",
+        }, run_owner_token="")
+        if not audit_changed:
+            # Ownership changed in the same transaction; do not leave a partially failed run.
+            raise RunOwnershipLost()
+        AuditEvent.objects.create(
+            actor=actor, action="plan_audit_run_failed", entity_type="plan_audit",
+            entity_id=str(audit.pk), details={"version": run.version},
+        )
+    return True
 
 
 logger = logging.getLogger(__name__)
@@ -127,85 +243,111 @@ def _run_reference_fingerprints(run):
 def run_audit(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
     run = None
+    worker_id = uuid.uuid4().hex
     try:
-        with transaction.atomic():
-            audit = PlanAudit.objects.select_for_update().select_related(
-                "organization", "plan", "summary_import"
-            ).get(pk=audit.pk)
-            if audit.summary_import.import_status != "accepted":
-                return Response({"error": "The selected summary import is not accepted."}, status=409)
-            if audit.status == "running" or audit.runs.filter(calculation_status="running").exists():
+        with _audit_execution_lock(audit.pk) as acquired:
+            if not acquired:
                 return Response({"error": "An audit run is already in progress."}, status=409)
-            now = timezone.now()
-            previous = current_audit_run(audit)
-            if previous and previous.publication_status in {"pending", "published"}:
-                was_published = previous.publication_status == "published"
-                previous.publication_status = "revoked"
-                previous.revoked_at = now
-                previous.revocation_reason = "A newer calculation run has started."
-                previous.save(update_fields=["publication_status", "revoked_at", "revocation_reason"])
-                if was_published:
-                    AuditEvent.objects.create(
-                        actor=request.user, action="plan_audit_publication_revoked",
-                        entity_type="plan_audit", entity_id=str(audit.pk),
-                        details={"version": previous.version, "reason": previous.revocation_reason},
-                    )
-            latest_version = audit.runs.order_by("-version").values_list("version", flat=True).first() or 0
-            version = latest_version + 1
-            run = PlanAuditRun.objects.create(
-                plan_audit=audit, version=version, calculation_status="running",
-                publication_status="pending", summary_import=audit.summary_import,
-                source_sha256=audit.summary_import.file_hash, initiated_by=request.user,
-                started_at=now, calculation_fingerprint=_calculation_fingerprint(),
-            )
-            audit.status = "running"
-            audit.summary = {}
-            audit.current_version = version
-            audit.published_version = None
-            audit.completed_at = None
-            audit.report_generated_at = None
-            audit.save(update_fields=["status", "summary", "current_version", "published_version",
-                                      "completed_at", "report_generated_at"])
-            AuditEvent.objects.create(
-                actor=request.user, action="plan_audit_run_started",
-                entity_type="plan_audit", entity_id=str(audit.pk),
-                details={"version": version, "source_sha256": run.source_sha256},
-            )
-        with transaction.atomic():
-            summary = run_plan_audit(audit, run)
+            with transaction.atomic():
+                audit = PlanAudit.objects.select_for_update().select_related(
+                    "organization", "plan", "summary_import"
+                ).get(pk=audit.pk)
+                if audit.summary_import.import_status != "accepted":
+                    return Response({"error": "The selected summary import is not accepted."}, status=409)
+                lease_seconds = getattr(settings, "PLAN_AUDIT_RUN_LEASE_SECONDS", 300)
+                stale_before = timezone.now() - timedelta(seconds=lease_seconds)
+                stale_runs = list(audit.runs.select_for_update().filter(calculation_status="running").filter(
+                    Q(heartbeat_at__lt=stale_before) |
+                    Q(heartbeat_at__isnull=True, started_at__lt=stale_before)))
+                active_runs = audit.runs.filter(calculation_status="running")
+                if active_runs.exclude(pk__in=[item.pk for item in stale_runs]).exists():
+                    return Response({"error": "An audit run is already in progress."}, status=409)
+                for abandoned in stale_runs:
+                    abandoned.calculation_status = "failed"
+                    abandoned.publication_status = "failed"
+                    abandoned.completed_at = timezone.now()
+                    abandoned.save(update_fields=["calculation_status", "publication_status", "completed_at"])
+                    AuditEvent.objects.create(actor=request.user, action="plan_audit_run_abandoned",
+                        entity_type="plan_audit", entity_id=str(audit.pk), details={"version": abandoned.version})
+                now = timezone.now()
+                previous = PlanAuditRun.objects.select_for_update().filter(
+                    plan_audit_id=audit.pk, version=audit.current_version,
+                ).first() if audit.current_version else None
+                if previous and previous.publication_status in {"pending", "published"}:
+                    was_published = previous.publication_status == "published"
+                    previous.publication_status = "revoked"
+                    previous.revoked_at = now
+                    previous.revocation_reason = "A newer calculation run has started."
+                    previous.save(update_fields=["publication_status", "revoked_at", "revocation_reason"])
+                    if was_published:
+                        AuditEvent.objects.create(actor=request.user, action="plan_audit_publication_revoked",
+                            entity_type="plan_audit", entity_id=str(audit.pk),
+                            details={"version": previous.version, "reason": previous.revocation_reason})
+                latest_version = audit.runs.order_by("-version").values_list("version", flat=True).first() or 0
+                version = latest_version + 1
+                run = PlanAuditRun.objects.create(
+                    plan_audit=audit, version=version, calculation_status="running",
+                    publication_status="pending", summary_import=audit.summary_import,
+                    source_sha256=audit.summary_import.file_hash, initiated_by=request.user,
+                    started_at=now, heartbeat_at=now, worker_id=worker_id,
+                    calculation_fingerprint=_calculation_fingerprint(),
+                )
+                audit.status = "running"
+                audit.summary = {}
+                audit.current_version = version
+                audit.published_version = None
+                audit.run_owner_token = worker_id
+                audit.completed_at = None
+                audit.report_generated_at = None
+                audit.save(update_fields=["status", "summary", "current_version", "published_version",
+                                          "run_owner_token", "completed_at", "report_generated_at"])
+                AuditEvent.objects.create(actor=request.user, action="plan_audit_run_started",
+                    entity_type="plan_audit", entity_id=str(audit.pk),
+                    details={"version": version, "source_sha256": run.source_sha256})
+
+            def heartbeat():
+                changed = PlanAuditRun.objects.filter(
+                    pk=run.pk, calculation_status="running", worker_id=worker_id,
+                    plan_audit__run_owner_token=worker_id, plan_audit__current_version=run.version,
+                ).update(heartbeat_at=timezone.now())
+                if not changed:
+                    raise RunOwnershipLost()
+
+            summary = run_plan_audit(audit, run, heartbeat=heartbeat)
             run.reference_fingerprints = _run_reference_fingerprints(run)
             run.result_fingerprint = run_result_fingerprint(run)
             run.calculation_status = "completed"
             run.completed_at = timezone.now()
-            run.save(update_fields=["reference_fingerprints", "result_fingerprint",
-                                    "calculation_status", "completed_at"])
-            audit.summary = summary
-            has_warnings = any(status != "VALID" for status in summary["quality_status_counts"])
-            audit.status = "needs_review" if has_warnings else "completed"
-            audit.completed_at = run.completed_at
-            audit.save(update_fields=["summary", "status", "completed_at"])
-            AuditEvent.objects.create(
-                actor=request.user, action="plan_audit_run_completed",
-                entity_type="plan_audit", entity_id=str(audit.pk),
-                details={"version": run.version, "result_fingerprint": run.result_fingerprint,
-                         "result_rows": summary["result_rows"],
-                         "savings_opportunities": summary["savings_opportunities"],
-                         "status": audit.status},
-            )
+            with transaction.atomic():
+                changed = PlanAuditRun.objects.filter(
+                        pk=run.pk, calculation_status="running", worker_id=worker_id,
+                        plan_audit__run_owner_token=worker_id, plan_audit__current_version=run.version,
+                ).update(reference_fingerprints=run.reference_fingerprints,
+                         result_fingerprint=run.result_fingerprint,
+                         calculation_status="completed", completed_at=run.completed_at)
+                if not changed:
+                    raise RunOwnershipLost()
+                audit.summary = summary
+                has_warnings = any(status != "VALID" for status in summary["quality_status_counts"])
+                audit.status = "needs_review" if has_warnings else "completed"
+                audit.completed_at = run.completed_at
+                changed = PlanAudit.objects.filter(
+                    pk=audit.pk, current_version=run.version, run_owner_token=worker_id,
+                ).update(summary=summary, status=audit.status, completed_at=run.completed_at,
+                         run_owner_token="")
+                if not changed:
+                    raise RunOwnershipLost()
+                audit.run_owner_token = ""
+                AuditEvent.objects.create(actor=request.user, action="plan_audit_run_completed",
+                    entity_type="plan_audit", entity_id=str(audit.pk),
+                    details={"version": run.version, "result_fingerprint": run.result_fingerprint,
+                             "result_rows": summary["result_rows"],
+                             "savings_opportunities": summary["savings_opportunities"], "status": audit.status})
+    except RunOwnershipLost:
+        return Response({"error": "Audit run ownership was lost."}, status=409)
     except Exception:
         logger.exception("Plan audit execution failed for audit id %s.", audit.pk)
-        with transaction.atomic():
-            PlanAudit.objects.filter(pk=audit.pk).update(
-                status="failed", summary={"error": "Audit execution failed; no result details were stored."})
-            if run:
-                PlanAuditRun.objects.filter(pk=run.pk).update(
-                    calculation_status="failed", publication_status="failed",
-                    completed_at=timezone.now())
-                AuditEvent.objects.create(
-                    actor=request.user, action="plan_audit_run_failed",
-                    entity_type="plan_audit", entity_id=str(audit.pk),
-                    details={"version": run.version},
-                )
+        _fail_owned_run(audit, run, worker_id, request.user)
         return Response({"error": "Audit execution failed. Check reference-data availability and server logs."},
                         status=500)
     return Response(audit_payload(audit, request.user))

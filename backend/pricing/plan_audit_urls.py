@@ -9,6 +9,8 @@ from . import plan_audit_setup as setup
 
 urlpatterns = [
     path("organizations/", setup.organizations, name="plan_audit_organizations"),
+    path("organizations/<int:organization_id>/status/", setup.organization_status,
+         name="plan_audit_organization_status"),
     path("organizations/<int:organization_id>/users/", setup.organization_access,
          name="plan_audit_organization_user_access"),
     path("organizations/<int:organization_id>/users/<int:user_id>/",

@@ -10,10 +10,10 @@ from django.conf import settings
 
 from pipeline.common import Dose, parse_hcpcs_dosage
 from . import data
-from .models import DrugUnitReview, NetworkRosterEntry, PlanAuditResult, SavingsOpportunity
+from .models import DrugUnitReview, NetworkRosterEntry, PlanAudit, PlanAuditResult, SavingsOpportunity
 
 
-def run_plan_audit(audit, audit_run):
+def run_plan_audit(audit, audit_run, heartbeat=None):
     summary_rows = list(audit.summary_import.records.all())
     codes = sorted({row.hcpcs_code for row in summary_rows})
     quarters = sorted({row.quarter for row in summary_rows})
@@ -25,6 +25,8 @@ def run_plan_audit(audit, audit_run):
 
     results, result_by_key = [], {}
     for source in summary_rows:
+        if heartbeat:
+            heartbeat()
         key = (source.hcpcs_code, source.site_npi, source.quarter, source.service_setting)
         notes = list(notes_by_code.get(source.hcpcs_code, []))
         if source.hcpcs_code not in scope:
@@ -102,9 +104,23 @@ def run_plan_audit(audit, audit_run):
         results.append(result)
         result_by_key[key] = (source, result, unit_ok)
 
-    PlanAuditResult.objects.bulk_create(results, batch_size=1000)
     opportunities = _build_opportunities(audit, audit_run, summary_rows, result_by_key, roster)
-    SavingsOpportunity.objects.bulk_create(opportunities, batch_size=1000)
+    # Fence the final result write and keep it atomic. A stale worker cannot pass
+    # the owner check and then race a new reservation while writing these rows.
+    from django.db import transaction
+    with transaction.atomic():
+        owns_audit = PlanAudit.objects.select_for_update().filter(
+            pk=audit.pk, current_version=audit_run.version,
+            run_owner_token=audit_run.worker_id,
+        ).exists()
+        if not owns_audit:
+            if heartbeat:
+                heartbeat()
+            raise RuntimeError("Audit run ownership was lost before result persistence.")
+        if heartbeat:
+            heartbeat()
+        PlanAuditResult.objects.bulk_create(results, batch_size=1000)
+        SavingsOpportunity.objects.bulk_create(opportunities, batch_size=1000)
     quality_counts = defaultdict(int)
     for result in results:
         quality_counts[result.data_quality_status] += 1

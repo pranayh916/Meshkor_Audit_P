@@ -4,6 +4,7 @@ import {
   XAxis, YAxis
 } from "recharts";
 import { STATUS_TEXT } from "./api.js";
+import { compareTableValues } from "./tableSort.js";
 
 export function Loading({ state, children }) {
   if (state.loading && !state.data) return <div className="loading-skeleton" aria-label="Loading data"><span /><span /><span /></div>;
@@ -52,14 +53,13 @@ export function Table({ columns, rows, initialSort, empty = "No rows." }) {
   const [sort, setSort] = useState(initialSort || { key: null, dir: "desc" });
   const sorted = useMemo(() => {
     if (!sort.key) return rows;
+    const column = columns.find((item) => item.key === sort.key);
     const s = [...rows].sort((a, b) => {
       const x = a[sort.key], y = b[sort.key];
-      if (x == null) return 1;
-      if (y == null) return -1;
-      return (x > y ? 1 : x < y ? -1 : 0) * (sort.dir === "asc" ? 1 : -1);
+      return compareTableValues(x, y, { numeric: Boolean(column?.num), direction: sort.dir });
     });
     return s;
-  }, [rows, sort]);
+  }, [columns, rows, sort]);
   if (!rows.length) return <div className="note">{empty}</div>;
   return (
     <div className="table-wrap">

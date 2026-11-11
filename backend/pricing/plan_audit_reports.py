@@ -163,8 +163,8 @@ def generate_plan_report(request, audit_id):
                                            "report_fingerprint": locked.report_fingerprint})
     return Response({"audit_id": audit.pk, "version": run.version,
                      "result_fingerprint": run.result_fingerprint,
-                     "report_fingerprint": run.report_fingerprint,
-                     "generated_at": audit.report_generated_at,
+                     "report_fingerprint": locked.report_fingerprint,
+                     "report_generated_at": current.report_generated_at,
                      "report_url": f"/api/v1/plan-audits/{audit.pk}/report/",
                      "csv_url": f"/api/v1/plan-audits/{audit.pk}/export-csv/"})
 

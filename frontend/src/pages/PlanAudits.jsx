@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { deleteJSON, downloadFile, getJSON, postJSON, uploadPlanSummary, uploadNetworkRoster } from "../api.js";
+import { deleteJSON, downloadFile, getAllPages, getJSON, patchJSON, postJSON, uploadPlanSummary, uploadNetworkRoster } from "../api.js";
 
 // ---------------------------------------------------------------------------
 // Role helpers
@@ -1121,7 +1121,7 @@ function ReviewReportsSection({ auditId, audit, reviews, quality, reviewer, anal
 // Section: Plan Setup (Admin / Analyst only)
 // ---------------------------------------------------------------------------
 function PlanSetupSection({
-  admin, analyst, busy, onRefresh,
+  admin, analyst, busy, onRefresh, refreshKey,
   organizations, plans, imports,
   organizationId, setOrganizationId,
   planId, setPlanId,
@@ -1135,6 +1135,14 @@ function PlanSetupSection({
   previewBusy, setPreviewBusy,
   error, setError, setErrorDetails, setNotice, setBusy,
 }) {
+  const [managementPlans, setManagementPlans] = useState([]);
+  useEffect(() => {
+    if (!admin) { setManagementPlans([]); return undefined; }
+    let alive = true;
+    getJSON("plans/").then((items) => alive && setManagementPlans(items))
+      .catch((e) => alive && setError(e.message));
+    return () => { alive = false; };
+  }, [admin, refreshKey]);
   const assignedUserIds = new Set(accessRows.map((row) => String(row.user_id)));
   const acceptedImports = imports.filter((item) => item.import_status === "accepted");
   const assignableUsers = viewerUsers.filter((item) => !assignedUserIds.has(String(item.id)));
@@ -1178,6 +1186,53 @@ function PlanSetupSection({
     <div className="plan-audit-admin-grid">
       {admin && (
         <>
+          <section className="dashboard-panel">
+            <h3 className="panel-title">Organization Management</h3>
+            {organizations.length ? (
+              <div className="table-wrap"><table className="executive-table">
+                <thead><tr><th>Organization</th><th>Type</th><th>Status</th><th>Actions</th></tr></thead>
+                <tbody>{organizations.map((organization) => {
+                  const nextStatus = organization.status === "active" ? "inactive" : "active";
+                  const effect = nextStatus === "inactive"
+                    ? "Users assigned to this organization will lose ordinary access to its plans, imports, and audits, including the ability to run or review audits. Existing records and reports will be retained."
+                    : "Assigned users will regain access to active plans according to their roles and existing publication permissions.";
+                  return <tr key={organization.id}>
+                    <td>{organization.organization_name}</td><td>{organization.organization_type}</td>
+                    <td>{organization.status}</td><td><button type="button" disabled={busy}
+                      onClick={() => {
+                        if (!window.confirm(`${nextStatus === "active" ? "Activate" : "Deactivate"} ${organization.organization_name}? ${effect}`)) return;
+                        act(() => patchJSON(`organizations/${organization.id}/status/`, { status: nextStatus }),
+                          `Organization ${nextStatus}.`);
+                      }}>{nextStatus === "active" ? "Activate" : "Deactivate"}</button></td>
+                  </tr>;
+                })}</tbody>
+              </table></div>
+            ) : <p className="muted">No organizations are available.</p>}
+          </section>
+
+          <section className="dashboard-panel">
+            <h3 className="panel-title">Plan Management</h3>
+            {managementPlans.length ? (
+              <div className="table-wrap"><table className="executive-table">
+                <thead><tr><th>Plan</th><th>Reference</th><th>Organization</th><th>Status</th><th>Actions</th></tr></thead>
+                <tbody>{managementPlans.map((plan) => {
+                  const nextStatus = plan.status === "active" ? "inactive" : "active";
+                  const effect = nextStatus === "inactive"
+                    ? "Ordinary users will lose access to this plan's imports and audits, including the ability to run or review audits. Existing records and reports will be retained."
+                    : "Assigned users will regain access, subject to their organization status, roles, and publication permissions.";
+                  return <tr key={plan.id}>
+                    <td>{plan.plan_name}</td><td>{plan.plan_reference}</td>
+                    <td>{plan.organization_name}</td><td>{plan.status}</td>
+                    <td><button type="button" disabled={busy}
+                      onClick={() => {
+                        if (!window.confirm(`${nextStatus === "active" ? "Activate" : "Deactivate"} ${plan.plan_name}? ${effect}`)) return;
+                        act(() => patchJSON(`plans/${plan.id}/`, { status: nextStatus }), `Plan ${nextStatus}.`);
+                      }}>{nextStatus === "active" ? "Activate" : "Deactivate"}</button></td>
+                  </tr>;
+                })}</tbody>
+              </table></div>
+            ) : <p className="muted">No plans are available.</p>}
+          </section>
           <section className="dashboard-panel">
             <h3 className="panel-title">Create an organization</h3>
             <form
@@ -1474,7 +1529,7 @@ function PlanSetupSection({
       {/* Import history */}
       {imports.length > 0 && (
         <section className="dashboard-panel" style={{ gridColumn: "1 / -1" }}>
-          <h3 className="panel-title">Claims summary import history</h3>
+          <h3 className="panel-title">Claims summary import history ({imports.length})</h3>
           <div className="table-wrap">
             <table className="executive-table">
               <thead>
@@ -1658,8 +1713,8 @@ export default function PlanAudits({ user }) {
     if (!planId) { setImports([]); setImportId(""); setAudits([]); setAuditId(""); return undefined; }
     let alive = true;
     Promise.all([
-      analyst ? getJSON("plan-audits/imports/", { plan_id: planId }) : Promise.resolve([]),
-      getJSON("plan-audits/", { plan_id: planId }),
+      analyst ? getAllPages("plan-audits/imports/", { plan_id: planId }) : Promise.resolve([]),
+      getAllPages("plan-audits/", { plan_id: planId }),
     ]).then(([importItems, auditItems]) => {
       if (!alive) return;
       setImports(importItems); setAudits(auditItems);
@@ -1903,6 +1958,7 @@ export default function PlanAudits({ user }) {
           analyst={analyst}
           busy={busy}
           onRefresh={refresh}
+          refreshKey={refreshKey}
           organizations={organizations}
           plans={plans}
           imports={imports}
