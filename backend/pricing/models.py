@@ -486,6 +486,50 @@ class SavingsOpportunity(ImmutableAuditRunRow):
         ]
 
 
+class SavingsOpportunityReviewQuerySet(models.QuerySet):
+    def bulk_create(self, *args, **kwargs):
+        raise ValidationError("Savings opportunity review history is immutable.")
+
+    def update(self, **kwargs):
+        raise ValidationError("Savings opportunity review history is immutable.")
+
+    def delete(self):
+        raise ValidationError("Savings opportunity review history is immutable.")
+
+
+class SavingsOpportunityReview(models.Model):
+    DECISIONS = [("approved", "Approved"), ("rejected", "Rejected"),
+                 ("not_actionable", "Not actionable")]
+
+    opportunity = models.ForeignKey(SavingsOpportunity, on_delete=models.PROTECT,
+                                    related_name="review_decisions")
+    audit_run = models.ForeignKey(PlanAuditRun, on_delete=models.PROTECT,
+                                  related_name="savings_review_decisions")
+    reviewer = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL,
+                                 related_name="savings_opportunity_reviews")
+    decision = models.CharField(max_length=20, choices=DECISIONS)
+    reason = models.TextField(max_length=2000)
+    evidence_references = models.JSONField(default=list)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = models.Manager.from_queryset(SavingsOpportunityReviewQuerySet)()
+
+    class Meta:
+        ordering = ["-created_at", "-pk"]
+        indexes = [models.Index(fields=["opportunity", "-created_at"],
+                                name="savings_review_latest_ix")]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Savings opportunity review history is immutable.")
+        if self.opportunity_id and self.audit_run_id != self.opportunity.audit_run_id:
+            raise ValidationError("Savings review must belong to the opportunity's audit version.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Savings opportunity review history is immutable.")
+
+
 class AuditReview(models.Model):
     STATUSES = [("submitted", "Submitted"), ("approved", "Approved"), ("rejected", "Rejected")]
 

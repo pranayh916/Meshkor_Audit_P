@@ -5,7 +5,7 @@ _CONTEXT_FIELDS = ("member_id", "plan_id", "hcpcs_code", "site_npi", "service_da
 _RESOLVED_STATUSES = {"paid", "approved", "adjusted", "reversed", "denied"}
 
 
-def resolve_claims(claims, quality):
+def resolve_claims(claims, quality, quarantined=()):
     """Resolve complete claim chains; fail closed on ambiguous dependencies."""
     by_id = defaultdict(list)
     for claim in claims:
@@ -15,6 +15,17 @@ def resolve_claims(claims, quality):
     children = defaultdict(set)
     action_counts = defaultdict(int)
     action_by_target = {}
+
+    # Invalid source rows never enter calculation, but their local references
+    # still quarantine any claim they could have replaced or reversed.
+    for context in quarantined:
+        claim_id = context.get("claim_id")
+        if claim_id:
+            invalid.add(claim_id)
+        for reference in (context.get("adjustment_reference"),
+                          context.get("reversal_reference")):
+            if reference:
+                invalid.add(reference)
 
     for claim in claims:
         claim_id = claim["claim_id"]

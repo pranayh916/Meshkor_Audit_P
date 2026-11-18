@@ -780,12 +780,14 @@ function ProviderNetworkSection({ auditId, audit }) {
 // ---------------------------------------------------------------------------
 // Section: Savings Opportunities
 // ---------------------------------------------------------------------------
-function SavingsSection({ auditId, audit }) {
+function SavingsSection({ auditId, audit, reviewer, onRefresh }) {
   const [savings, setSavings] = useState([]);
   const [total, setTotal] = useState(0);
   const [nextOffset, setNextOffset] = useState(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
+  const [savingReview, setSavingReview] = useState(false);
+  const [reviewVersion, setReviewVersion] = useState(0);
 
   useEffect(() => {
     setSavings([]);
@@ -803,7 +805,7 @@ function SavingsSection({ auditId, audit }) {
       })
       .catch((e) => alive && setError(e.message));
     return () => { alive = false; };
-  }, [auditId]);
+  }, [auditId, reviewVersion]);
 
   async function loadMore() {
     if (nextOffset == null) return;
@@ -826,7 +828,7 @@ function SavingsSection({ auditId, audit }) {
           Evidence-backed price differences observed between sites for the same HCPCS, quarter, service setting,
           and billing unit. Alternatives are limited to sites with verified full-quarter in-network roster coverage.
           These figures are <strong>potential opportunities for review, not guaranteed or recoverable overpayments.</strong>
-          Clinical and feasibility review remain pending for all items below.
+          Review decisions are tied to this immutable audit version and do not change its calculations.
         </p>
         <ErrorBox error={error} />
         {savings.length ? (
@@ -847,6 +849,7 @@ function SavingsSection({ auditId, audit }) {
                   <th>Network (alternative)</th>
                   <th>Clinical review</th>
                   <th>Validation</th>
+                  {reviewer && <th>Reviewer disposition</th>}
                 </tr>
               </thead>
               <tbody>
@@ -865,6 +868,49 @@ function SavingsSection({ auditId, audit }) {
                     <td>{row.network_status}</td>
                     <td>{row.clinical_review_status}</td>
                     <td>{row.validation_status}</td>
+                    {reviewer && <td>
+                      <form className="plan-audit-form" onSubmit={async (event) => {
+                        event.preventDefault();
+                        const form = new FormData(event.currentTarget);
+                        setSavingReview(true); setError("");
+                        try {
+                          await postJSON(`plan-audits/${auditId}/savings/${row.id}/review/`, {
+                            version: audit.current_version,
+                            result_fingerprint: audit.result_fingerprint,
+                            decision: form.get("decision"), reason: form.get("reason"),
+                            evidence_references: form.getAll("evidence_references"),
+                          });
+                          setReviewVersion((version) => version + 1);
+                          onRefresh();
+                        } catch (e) { setError(e.message); }
+                        finally { setSavingReview(false); }
+                      }}>
+                        <span>{row.review_decision ? `Latest: ${row.review_decision}` : "No disposition"}</span>
+                        {row.review_reason && <span>{row.review_reason}</span>}
+                        <label>Disposition
+                          <select name="decision" defaultValue="approved" required>
+                            <option value="approved">Approve</option>
+                            <option value="rejected">Reject</option>
+                            <option value="not_actionable">Not actionable</option>
+                          </select>
+                        </label>
+                        <label>Reason
+                          <textarea name="reason" minLength="1" maxLength="2000" required />
+                        </label>
+                        <label>Evidence references
+                          <select name="evidence_references" multiple required defaultValue={[
+                            "claims_summary_sha256", "network_roster_file_hashes",
+                          ].filter((key) => row.source_references?.[key])}>
+                            {Object.entries(row.source_references || {}).filter(([, value]) =>
+                              value !== null && value !== "" && (!Array.isArray(value) || value.length > 0)
+                            ).map(([key]) => <option key={key} value={key}>{key}</option>)}
+                          </select>
+                        </label>
+                        <button type="submit" disabled={savingReview}>
+                          {savingReview ? "Saving…" : "Save disposition"}
+                        </button>
+                      </form>
+                    </td>}
                   </tr>
                 ))}
               </tbody>
@@ -1936,7 +1982,7 @@ export default function PlanAudits({ user }) {
         <ProviderNetworkSection auditId={auditId} audit={audit} />
       )}
       {activeTab === "savings" && (
-        <SavingsSection auditId={auditId} audit={audit} />
+        <SavingsSection auditId={auditId} audit={audit} reviewer={reviewer} onRefresh={refresh} />
       )}
       {activeTab === "review" && (
         <ReviewReportsSection

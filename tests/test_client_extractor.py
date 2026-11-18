@@ -220,6 +220,35 @@ def test_mk10_invalid_reversal_chains_fail_closed(case):
     assert quality["excluded_records"] == len(validated)
 
 
+def test_mk10_malformed_reversal_quarantines_valid_target_in_full_cli(tmp_path):
+    source = tmp_path / "claims_with_malformed_reversal.csv"
+    rows = [_raw_claim("reversed-original", "member-original", allowed_amount="900", paid_amount="800")]
+    reversal = _raw_claim("invalid-reversal", "member-original", "reversed",
+                          reversal_reference="reversed-original", paid_amount="-1")
+    rows.append(reversal)
+    rows.extend(_raw_claim(f"independent-{index}", f"member-{index}",
+                           allowed_amount="10", paid_amount="5") for index in range(11))
+    _write_source(source, rows)
+    config = tmp_path / "client_config.yaml"
+    config.write_text(yaml.safe_dump({
+        "plan_id": "PLAN-TEST", "plan_reference": "TEST-PLAN",
+        "hcpcs_billing_units": {"J9271": {"qty": 1, "unit": "MG", "verification_status": "validated",
+            "source_reference": "synthetic", "source_sha256": "a" * 64}},
+    }), encoding="utf-8")
+    output = tmp_path / "output"
+
+    assert extract_claims(Namespace(claims=source, config=config, output=output)) == 0
+    with (output / "claims_summary.csv").open(newline="", encoding="utf-8-sig") as stream:
+        exported = list(csv.DictReader(stream))
+    quality = json.loads((output / "data_quality.json").read_text(encoding="utf-8"))["summary"]
+    assert len(exported) == 1
+    assert exported[0]["total_allowed_amount"] == "110"
+    assert exported[0]["total_paid_amount"] == "55"
+    assert quality["invalid_records"] == 1
+    assert quality["excluded_records"] == 2
+    assert "member-original" not in (output / "data_quality.json").read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("branch", [
     (("B", "A"), ("C", "A")),
     (("B", "A"), ("C", "B"), ("D", "B")),

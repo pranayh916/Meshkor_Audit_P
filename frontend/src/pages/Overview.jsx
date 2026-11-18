@@ -1,9 +1,22 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { downloadFile, fmt, useApi } from "../api.js";
+import { downloadFile, fmt, getAllPages, useApi } from "../api.js";
 import { Loading, MarkupBars, Table } from "../components.jsx";
 
 const hasRole = (user, ...roles) => user?.roles?.some((role) => roles.includes(role));
+
+function usePlanAuditList() {
+  const [state, setState] = useState({ data: null, loading: true, error: null });
+  useEffect(() => {
+    let current = true;
+    setState({ data: null, loading: true, error: null });
+    getAllPages("plan-audits")
+      .then((data) => { if (current) setState({ data, loading: false, error: null }); })
+      .catch((error) => { if (current) setState({ data: null, loading: false, error }); });
+    return () => { current = false; };
+  }, []);
+  return state;
+}
 
 function DashboardFrame({ role, title, description, links, children }) {
   return <div className={`overview-page role-overview role-overview--${role.toLowerCase()}`}>
@@ -31,7 +44,7 @@ function AdminDashboard() {
   const accounts = useApi("user-accounts");
   const jobs = useApi("data-sources/processing-jobs", { limit: 5 });
   const quality = useApi("hospital-file-quality");
-  const runs = useApi("plan-audits");
+  const runs = usePlanAuditList();
   const users = accounts.data || [];
   const activeRuns = (runs.data || []).filter((run) => ["running", "needs_review", "completed"].includes(run.status));
   return <DashboardFrame role="Admin" title="Platform administration" description="Monitor authorized organization, account, pipeline, audit and quality status."
@@ -56,7 +69,7 @@ function AnalystDashboard() {
   const jobs = useApi("data-sources/processing-jobs", { limit: 5 });
   const organizations = useApi("organizations");
   const plans = useApi("plans");
-  const audits = useApi("plan-audits");
+  const audits = usePlanAuditList();
   const quality = useApi("hospital-file-quality");
   const requiredSources = (sources.data || []).filter((source) => source.required);
   const availableRequiredSources = requiredSources.filter((source) => source.status === "available").length;
@@ -97,7 +110,7 @@ function AnalystDashboard() {
 function ReviewerDashboard() {
   const reviews = useApi("drug-unit-validations");
   const reports = useApi("reports");
-  const audits = useApi("plan-audits");
+  const audits = usePlanAuditList();
   const reportRows = reports.data || [];
   const awaitingRelease = reportRows.filter((report) => report.status === "generated").length;
   const planRows = audits.data || [];
@@ -139,7 +152,7 @@ function ReviewerDashboard() {
 }
 
 function ClientDashboard() {
-  const audits = useApi("plan-audits");
+  const audits = usePlanAuditList();
   const published = (audits.data || []).filter((audit) => audit.can_view_results && audit.publication_status === "published")
     .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
   const latest = published[0];

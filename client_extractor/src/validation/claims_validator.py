@@ -24,6 +24,22 @@ def normalize_text(value):
     return str(value).strip()
 
 
+def claim_chain_context(row, source_row):
+    """Return only local identifiers/references needed to quarantine a bad row."""
+    normalized = {normalize_header(key): value for key, value in row.items()}
+    claim_id = normalize_text(normalized.get("claim_id"))
+    adjustment_reference = normalize_text(normalized.get("adjustment_reference"))
+    reversal_reference = normalize_text(normalized.get("reversal_reference"))
+    if not (claim_id or adjustment_reference or reversal_reference):
+        return None
+    return {
+        "claim_id": claim_id,
+        "adjustment_reference": adjustment_reference,
+        "reversal_reference": reversal_reference,
+        "source_row": source_row,
+    }
+
+
 def parse_date(value):
     if isinstance(value, datetime):
         return value.date()

@@ -224,21 +224,26 @@ function clean(p) {
 
 /** Fetch on mount and whenever `deps` change. */
 export function useApi(path, params, deps = []) {
-  const [state, set] = useState({ data: null, error: null, loading: true });
+  const requestKey = JSON.stringify([path, clean(params), deps]);
+  const [storedState, set] = useState({ key: null, data: null, error: null, loading: true });
   useEffect(() => {
     if (!path) {
-      set({ data: null, error: null, loading: false });
+      set({ key: requestKey, data: null, error: null, loading: false });
       return;
     }
     let live = true;
-    set((s) => ({ ...s, loading: true }));
+    set({ key: requestKey, data: null, error: null, loading: true });
     getJSON(path, params)
-      .then((data) => live && set({ data, error: null, loading: false }))
-      .catch((error) => live && set({ data: null, error, loading: false }));
+      .then((data) => live && set({ key: requestKey, data, error: null, loading: false }))
+      .catch((error) => live && set({ key: requestKey, data: null, error, loading: false }));
     return () => { live = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path, JSON.stringify(clean(params)), ...deps]);
-  return state;
+  // The serialized key also covers `deps`, and makes the request/effect lifecycle
+  // stable when callers pass a new array literal on each render.
+  }, [requestKey]);
+  if (storedState.key !== requestKey) {
+    return { data: null, error: null, loading: Boolean(path) };
+  }
+  return storedState;
 }
 
 export const fmt = {
