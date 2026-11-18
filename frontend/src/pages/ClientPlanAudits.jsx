@@ -1,9 +1,17 @@
 import { useEffect, useState } from "react";
-import { downloadFile, fmt, useApi } from "../api.js";
+import { downloadFile, fmt, getAllPages, useApi } from "../api.js";
 import { Loading, Table } from "../components.jsx";
 
 export default function ClientPlanAudits() {
-  const state = useApi("plan-audits");
+  const [state, setState] = useState({ data: null, error: null, loading: true });
+  useEffect(() => {
+    let active = true;
+    setState({ data: null, error: null, loading: true });
+    getAllPages("plan-audits")
+      .then((data) => active && setState({ data, error: null, loading: false }))
+      .catch((error) => active && setState({ data: null, error, loading: false }));
+    return () => { active = false; };
+  }, []);
   const approved = (state.data || []).filter((audit) => audit.can_view_results && audit.publication_status === "published");
   const [selectedId, setSelectedId] = useState("");
   const [downloadError, setDownloadError] = useState("");
@@ -16,9 +24,21 @@ export default function ClientPlanAudits() {
   const overview = useApi(base ? `${base}overview` : null, null, [selected?.id]);
   const spending = useApi(base ? `${base}historical-spending` : null, null, [selected?.id]);
   const drugAnalysis = useApi(base ? `${base}drug-analysis` : null, null, [selected?.id]);
-  const hospitalComparison = useApi(base ? `${base}hospital-comparison` : null, null, [selected?.id]);
+  const [hospitalComparison, setHospitalComparison] = useState({ data: null, error: null, loading: true });
   const quality = useApi(base ? `${base}quality` : null, null, [selected?.id]);
   const savings = useApi(base ? `${base}savings` : null, null, [selected?.id]);
+  useEffect(() => {
+    if (!selected) {
+      setHospitalComparison({ data: null, error: null, loading: false });
+      return undefined;
+    }
+    let active = true;
+    setHospitalComparison({ data: null, error: null, loading: true });
+    getAllPages(`plan-audits/${selected.id}/hospital-comparison`)
+      .then((rows) => active && setHospitalComparison({ data: rows, error: null, loading: false }))
+      .catch((error) => active && setHospitalComparison({ data: null, error, loading: false }));
+    return () => { active = false; };
+  }, [selected?.id]);
   const metrics = overview.data?.metrics || {};
   async function download(kind) {
     if (!selected) return;

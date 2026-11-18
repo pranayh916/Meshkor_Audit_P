@@ -861,15 +861,57 @@ def review_drug_unit(request, hcpcs: str):
     if not quantity.is_finite() or quantity != Decimal(str(dose.qty)) or unit != dose.unit:
         return Response({"error": f"The review must use the CMS ASP dosage {dose.qty:g} {dose.unit}."}, status=400)
 
-    review, _ = DrugUnitReview.objects.update_or_create(
-        hcpcs=code, scope_source_sha256=info["drug_selection_source_sha256"],
-        defaults={"billing_qty": quantity, "billing_unit": unit, "status": decision,
-                  "notes": note, "reviewer": request.user,
-                  "clinical_reviewer_name": clinical_reviewer_name},
-    )
-    AuditEvent.objects.create(actor=request.user, action="drug_unit_reviewed", entity_type="drug",
-                              entity_id=code, details={"status": decision,
-                              "scope_source_sha256": review.scope_source_sha256})
+    from .models import PlanAudit, PlanAuditResult, PlanAuditRun
+    with transaction.atomic():
+        # Use the same lock order as publication: audit, run, then clinical review.
+        audit_ids = list(PlanAuditResult.objects.filter(hcpcs_code=code)
+                         .values_list("plan_audit_id", flat=True).distinct())
+        audits = list(PlanAudit.objects.select_for_update().filter(pk__in=audit_ids).order_by("pk"))
+        runs = list(PlanAuditRun.objects.select_for_update().filter(
+            plan_audit_id__in=[item.pk for item in audits]
+        ).order_by("plan_audit_id", "version"))
+        review = DrugUnitReview.objects.select_for_update().filter(
+            hcpcs=code, scope_source_sha256=info["drug_selection_source_sha256"],
+        ).first()
+        if review is None:
+            review = DrugUnitReview(hcpcs=code,
+                scope_source_sha256=info["drug_selection_source_sha256"])
+        review.billing_qty = quantity
+        review.billing_unit = unit
+        review.status = decision
+        review.notes = note
+        review.reviewer = request.user
+        review.clinical_reviewer_name = clinical_reviewer_name
+        review.save()
+        invalidates_publication = not (
+            decision == "validated"
+            and info["drug_selection_source_sha256"] == scope[code].get("selection_source_sha256")
+            and quantity == Decimal(str((scope[code].get("billing_unit") or {}).get("qty")))
+            and unit == str((scope[code].get("billing_unit") or {}).get("unit", "")).upper()
+        )
+        if invalidates_publication:
+            now = timezone.now()
+            for audit in audits:
+                audit_runs = [item for item in runs if item.plan_audit_id == audit.pk
+                              and item.publication_status == "published"]
+                for run in audit_runs:
+                    if not run.results.filter(hcpcs_code=code).exists():
+                        continue
+                    run.publication_status = "revoked"
+                    run.revoked_at = now
+                    run.revocation_reason = "Required clinical unit approval is no longer current."
+                    run.save(update_fields=["publication_status", "revoked_at", "revocation_reason"])
+                    if audit.published_version == run.version:
+                        audit.published_version = None
+                        audit.status = "needs_review"
+                        audit.save(update_fields=["published_version", "status"])
+                    AuditEvent.objects.create(actor=request.user, action="plan_audit_clinical_evidence_revoked",
+                        entity_type="plan_audit", entity_id=str(audit.pk),
+                        details={"version": run.version, "hcpcs": code,
+                                 "scope_source_sha256": review.scope_source_sha256})
+        AuditEvent.objects.create(actor=request.user, action="drug_unit_reviewed", entity_type="drug",
+                                  entity_id=code, details={"status": decision,
+                                  "scope_source_sha256": review.scope_source_sha256})
 
     # The pipeline remains runnable without Django. Export only scope-bound,
     # reviewer-approved decisions to its explicit input folder.

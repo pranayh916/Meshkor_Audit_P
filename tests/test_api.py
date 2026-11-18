@@ -3432,3 +3432,294 @@ def test_mk09_network_status_requires_consistent_full_quarter_coverage(monkeypat
     assert verified_opportunities[0]["network_status"] == "IN_NETWORK"
     assert verified_opportunities[0]["source_references"]["network_roster_file_hashes"] == [q1_in.source_hash]
 
+
+@pytest.mark.django_db(transaction=True)
+def test_a02_current_clinical_evidence_fences_publication_and_revokes_client_access(
+        monkeypatch, tmp_path):
+    import hashlib
+    import json
+    from django.contrib.auth import get_user_model
+    from django.test import Client as DjangoClient
+    from django.utils import timezone
+    from pricing import data
+    from pricing.models import (ClaimsSummaryImport, ClaimsSummaryRecord, DrugUnitReview,
+        Plan, PlanAudit, PlanAuditArtifact, PlanAuditResult, PlanAuditRun,
+        PlanOrganization, PlanOrganizationAccess)
+    from pricing.plan_audit_common import clinical_evidence_valid, published_run, run_result_fingerprint
+
+    admin = get_user_model().objects.create_superuser(
+        username="a02-clinical-admin", email="a02@example.invalid", password="test-only")
+    client = mfa_force_login(DjangoClient(), admin)
+    organization = PlanOrganization.objects.create(
+        organization_name="A02 Clinical Evidence Synthetic", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="Clinical Plan",
+                               plan_reference="A02-CLINICAL-PLAN")
+    imported = ClaimsSummaryImport.objects.create(organization=organization, plan=plan,
+        source_file_name="synthetic.csv", file_hash="c" * 64, schema_version="1.0",
+        import_status="accepted")
+    record = ClaimsSummaryRecord.objects.create(summary_import=imported,
+        plan_reference=plan.plan_reference, hcpcs_code="J9271", site_npi="1000000004",
+        quarter="2026Q1", service_setting="outpatient_hospital", total_units=1,
+        total_allowed_amount=100, total_paid_amount=80, member_count_band="11-50",
+        source_period="2026Q1", extraction_timestamp=timezone.now(), schema_version="1.0")
+    audit = PlanAudit.objects.create(organization=organization, plan=plan, summary_import=imported,
+        audit_name="Clinical validation", reporting_period="2026Q1", status="completed",
+        created_by=admin, current_version=1)
+    run = PlanAuditRun.objects.create(plan_audit=audit, version=1, calculation_status="running",
+        publication_status="pending", summary_import=imported, source_sha256=imported.file_hash,
+        initiated_by=admin, started_at=timezone.now(), worker_id="synthetic-worker")
+    scope_hash = "a" * 64
+    refs = {"unit_review_status": "validated", "unit_review_source_sha256": scope_hash,
+        "drug_selection_source_sha256": scope_hash, "unit_review_billing_qty": "1",
+        "unit_review_billing_unit": "MG"}
+    PlanAuditResult.objects.create(plan_audit=audit, audit_run=run, summary_record=record,
+        hcpcs_code="J9271", site_npi="1000000004", quarter="2026Q1",
+        service_setting="outpatient_hospital", total_units=1, total_allowed_amount=100,
+        total_paid_amount=80, member_count_band="11-50", data_quality_status="VALID",
+        source_references=refs)
+    review = DrugUnitReview.objects.create(hcpcs="J9271", scope_source_sha256=scope_hash,
+        billing_qty=1, billing_unit="MG", status="validated", notes="Synthetic approval evidence.",
+        clinical_reviewer_name="Synthetic pharmacist", reviewer=admin)
+    monkeypatch.setattr(data, "run_info", lambda: {"drug_selection_source_sha256": scope_hash})
+    monkeypatch.setattr(data, "drug_config", lambda: {"J9271": {
+        "selection_source_sha256": scope_hash, "asp_dosage": "1 MG",
+        "billing_unit": {"qty": 1, "unit": "MG"},
+    }})
+    review.status = "rejected"
+    review.save(update_fields=["status", "reviewed_at"])
+    assert not clinical_evidence_valid(run)
+    review.status = "validated"
+    review.save(update_fields=["status", "reviewed_at"])
+    monkeypatch.setattr(data, "run_info", lambda: {"drug_selection_source_sha256": "f" * 64})
+    assert not clinical_evidence_valid(run)
+    monkeypatch.setattr(data, "run_info", lambda: {"drug_selection_source_sha256": scope_hash})
+    assert clinical_evidence_valid(run)
+    run.calculation_status = "completed"
+    run.completed_at = timezone.now()
+    run.result_fingerprint = run_result_fingerprint(run)
+    run.save(update_fields=["calculation_status", "completed_at", "result_fingerprint"])
+    audit.published_version = 1
+    audit.save(update_fields=["published_version"])
+    for kind, content in (("pdf", b"synthetic-pdf"), ("csv", b"synthetic-csv")):
+        PlanAuditArtifact.objects.create(audit_run=run, artifact_type=kind, content=content,
+            sha256=hashlib.sha256(content).hexdigest(), created_by=admin)
+    artifacts = {item.artifact_type: item.sha256 for item in run.artifacts.all()}
+    run.publication_status = "published"
+    run.review_status = "approved"
+    run.approved_by = admin
+    run.approved_at = timezone.now()
+    run.published_at = timezone.now()
+    run.report_fingerprint = hashlib.sha256(json.dumps(artifacts, sort_keys=True,
+        separators=(",", ":")).encode()).hexdigest()
+    run.save(update_fields=["publication_status", "review_status", "approved_by", "approved_at",
+                            "published_at", "report_fingerprint"])
+    audit.published_version = 1
+    audit.save(update_fields=["published_version"])
+    assert published_run(audit) is not None
+
+    import pipeline.common
+    monkeypatch.setattr(pipeline.common, "paths", lambda: {"raw": tmp_path})
+    rejected = client.post("/api/v1/drug-selection-scope/J9271/unit-review/", {
+        "status": "rejected", "billing_qty": "1", "billing_unit": "MG",
+        "clinical_reviewer_name": "Synthetic pharmacist", "notes": "Synthetic rejection evidence.",
+    }, content_type="application/json")
+    assert rejected.status_code == 200, rejected.content
+    review.refresh_from_db()
+    run.refresh_from_db()
+    audit.refresh_from_db()
+    assert review.status == "rejected"
+    assert run.publication_status == "revoked"
+    assert audit.published_version is None
+    assert published_run(audit) is None
+
+    # Race an approval against a new rejection. Both paths lock audit, run,
+    # then the clinical review row; a rejected review must win the final state.
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from django.db import close_old_connections
+    from django.contrib.auth.models import Group
+    from rest_framework.test import APIRequestFactory, force_authenticate
+    from pricing.models import PlanAuditResult, PlanAuditRun
+    import pricing.plan_audit_reports as reports
+    from pricing.views import review_drug_unit
+    monkeypatch.setattr(reports, "_calculation_fingerprint", lambda: "f" * 64)
+    review.status = "validated"
+    review.save(update_fields=["status", "reviewed_at"])
+    concurrent_run = PlanAuditRun.objects.create(plan_audit=audit, version=2,
+        calculation_status="running", publication_status="pending", summary_import=imported,
+        source_sha256=imported.file_hash, initiated_by=admin, started_at=timezone.now(),
+        worker_id="synthetic-concurrent-worker", calculation_fingerprint="f" * 64)
+    PlanAuditResult.objects.create(plan_audit=audit, audit_run=concurrent_run, summary_record=record,
+        hcpcs_code="J9271", site_npi="1000000004", quarter="2026Q1",
+        service_setting="outpatient_hospital", total_units=1, total_allowed_amount=100,
+        total_paid_amount=80, member_count_band="11-50", data_quality_status="VALID",
+        source_references=refs)
+    concurrent_run.calculation_status = "completed"
+    concurrent_run.completed_at = timezone.now()
+    concurrent_run.result_fingerprint = run_result_fingerprint(concurrent_run)
+    concurrent_run.save(update_fields=["calculation_status", "completed_at", "result_fingerprint"])
+    audit.current_version = 2
+    audit.published_version = None
+    audit.save(update_fields=["current_version", "published_version"])
+    for kind, content in (("pdf", b"synthetic-v2-pdf"), ("csv", b"synthetic-v2-csv")):
+        PlanAuditArtifact.objects.create(audit_run=concurrent_run, artifact_type=kind,
+            content=content, sha256=hashlib.sha256(content).hexdigest(), created_by=admin)
+    report_hashes = {item.artifact_type: item.sha256 for item in concurrent_run.artifacts.all()}
+    concurrent_run.report_fingerprint = hashlib.sha256(json.dumps(report_hashes, sort_keys=True,
+        separators=(",", ":")).encode()).hexdigest()
+    concurrent_run.save(update_fields=["report_fingerprint"])
+    reviewer = get_user_model().objects.create_user(username="a02-concurrent-reviewer", password="test")
+    reviewer.groups.add(Group.objects.get_or_create(name="REVIEWER")[0])
+    PlanOrganizationAccess.objects.create(organization=organization, user=reviewer, granted_by=admin)
+    barrier = Barrier(2)
+    binding = {"version": 2, "result_fingerprint": concurrent_run.result_fingerprint}
+    def approve_concurrently():
+        close_old_connections(); barrier.wait()
+        try:
+            request = APIRequestFactory().post("/approve/",
+                {"comments": "Independent synthetic approval.", **binding}, format="json")
+            force_authenticate(request, user=reviewer)
+            return reports.approve_plan_audit(request, audit.pk)
+        finally:
+            close_old_connections()
+    def reject_clinical_concurrently():
+        close_old_connections(); barrier.wait()
+        try:
+            request = APIRequestFactory().post("/unit-review/", {
+                "status": "rejected", "billing_qty": "1", "billing_unit": "MG",
+                "clinical_reviewer_name": "Synthetic pharmacist", "notes": "Concurrent rejection evidence.",
+            }, format="json")
+            force_authenticate(request, user=admin)
+            return review_drug_unit(request, "J9271")
+        finally:
+            close_old_connections()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        approval_future = pool.submit(approve_concurrently)
+        rejection_future = pool.submit(reject_clinical_concurrently)
+        approval_response = approval_future.result(timeout=30)
+        rejection_response = rejection_future.result(timeout=30)
+    assert approval_response.status_code in {200, 409}, approval_response.content
+    assert rejection_response.status_code == 200, rejection_response.content
+    concurrent_run.refresh_from_db()
+    audit.refresh_from_db()
+    assert concurrent_run.publication_status != "published"
+    assert audit.published_version != concurrent_run.version
+    assert published_run(audit) is None
+
+
+@pytest.mark.django_db
+def test_a03_savings_dispositions_are_authorized_immutable_and_version_scoped(monkeypatch):
+    from django.core.exceptions import ValidationError
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from django.test import Client as DjangoClient
+    from django.utils import timezone
+    from pricing.models import (AuditEvent, ClaimsSummaryImport, Plan, PlanAudit,
+        PlanAuditRun, PlanOrganization, PlanOrganizationAccess, SavingsOpportunity,
+        SavingsOpportunityReview)
+    from pricing.plan_audit_common import run_result_fingerprint
+    import pricing.plan_audit_common as common
+    import pricing.plan_audit_reports as reports
+
+    admin = get_user_model().objects.create_superuser(
+        username="a03-savings-admin", email="a03@example.invalid", password="test-only")
+    client = mfa_force_login(DjangoClient(), admin)
+    organization = PlanOrganization.objects.create(
+        organization_name="A03 Savings Review Synthetic", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="Savings Plan",
+                               plan_reference="A03-SAVINGS-PLAN")
+    imported = ClaimsSummaryImport.objects.create(organization=organization, plan=plan,
+        source_file_name="synthetic.csv", file_hash="d" * 64, schema_version="1.0",
+        import_status="accepted")
+    audit = PlanAudit.objects.create(organization=organization, plan=plan, summary_import=imported,
+        audit_name="Savings review", reporting_period="2026Q1", status="completed",
+        created_by=admin, current_version=1)
+    run = PlanAuditRun.objects.create(plan_audit=audit, version=1, calculation_status="running",
+        summary_import=imported, source_sha256=imported.file_hash, initiated_by=admin,
+        started_at=timezone.now(), worker_id="synthetic-worker")
+    def opportunity(site, alternative, refs):
+        return SavingsOpportunity.objects.create(plan_audit=audit, audit_run=run,
+            hcpcs_code="J9271", quarter="2026Q1", service_setting="outpatient_hospital",
+            current_site_npi=site, alternative_site_npi=alternative,
+            current_allowed_price_per_unit=100, alternative_allowed_price_per_unit=80,
+            units=10, potential_allowed_savings=200, network_status="IN_NETWORK",
+            source_references=refs)
+    refs = {"claims_summary_sha256": "c" * 64, "network_roster_file_hashes": ["e" * 64],
+            "alternative_is_claims_observed": True}
+    rejected_candidate = opportunity("1000000004", "1000000012", refs)
+    approved_candidate = opportunity("1000000020", "1000000038", refs)
+    run.calculation_status = "completed"
+    run.completed_at = timezone.now()
+    audit.current_version = 1
+    audit.save(update_fields=["current_version"])
+    run.result_fingerprint = run_result_fingerprint(run)
+    run.save(update_fields=["calculation_status", "completed_at", "result_fingerprint"])
+    binding = {"version": 1, "result_fingerprint": run.result_fingerprint}
+    endpoint = lambda item: f"/api/v1/plan-audits/{audit.pk}/savings/{item.pk}/review/"
+
+    denied_user = get_user_model().objects.create_user(username="a03-analyst-only", password="test")
+    denied_user.groups.add(Group.objects.get_or_create(name="ANALYST")[0])
+    denied_client = DjangoClient()
+    mfa_force_login(denied_client, denied_user)
+    denied = denied_client.post(endpoint(rejected_candidate), {
+        "decision": "rejected", "reason": "Synthetic review reason.",
+        "evidence_references": ["claims_summary_sha256"], **binding,
+    }, content_type="application/json")
+    assert denied.status_code == 403
+
+    payload = {"decision": "rejected", "reason": "Synthetic review reason.",
+        "evidence_references": ["claims_summary_sha256", "network_roster_file_hashes"], **binding}
+    response = client.post(endpoint(rejected_candidate), payload, content_type="application/json")
+    assert response.status_code == 201, response.content
+    assert response.json()["decision"] == "rejected"
+    assert SavingsOpportunityReview.objects.get(opportunity=rejected_candidate).evidence_references == [
+        {"key": "claims_summary_sha256", "value": "c" * 64},
+        {"key": "network_roster_file_hashes", "value": ["e" * 64]},
+    ]
+    assert rejected_candidate.validation_status == "pending"
+    assert AuditEvent.objects.filter(action="savings_opportunity_reviewed",
+                                     entity_id=str(rejected_candidate.pk)).exists()
+    with pytest.raises(ValidationError):
+        SavingsOpportunityReview.objects.filter(opportunity=rejected_candidate).update(decision="approved")
+
+    monkeypatch.setattr(reports, "clinical_evidence_valid", lambda *args, **kwargs: True)
+    approved_payload = {**payload, "decision": "approved"}
+    approved = client.post(endpoint(approved_candidate), approved_payload, content_type="application/json")
+    assert approved.status_code == 201, approved.content
+    monkeypatch.setattr(common, "published_run", lambda candidate_audit: run)
+    client_user = get_user_model().objects.create_user(username="a03-client", password="test")
+    client_user.groups.add(Group.objects.get_or_create(name="CLIENT")[0])
+    PlanOrganizationAccess.objects.create(organization=organization, user=client_user, granted_by=admin)
+    external_client = DjangoClient()
+    mfa_force_login(external_client, client_user)
+    visible = external_client.get(f"/api/v1/plan-audits/{audit.pk}/savings/")
+    assert visible.status_code == 200, visible.content
+    assert [row["id"] for row in visible.json()["results"]] == [approved_candidate.pk]
+    assert visible.json()["results"][0]["validation_status"] == "validated"
+    assert "source_references" not in visible.json()["results"][0]
+    foreign_client_user = get_user_model().objects.create_user(
+        username="a03-foreign-client", password="test")
+    foreign_client_user.groups.add(Group.objects.get_or_create(name="CLIENT")[0])
+    foreign_client = mfa_force_login(DjangoClient(), foreign_client_user)
+    assert foreign_client.get(f"/api/v1/plan-audits/{audit.pk}/savings/").status_code == 404
+
+    new_run = PlanAuditRun.objects.create(plan_audit=audit, version=2, calculation_status="running",
+        summary_import=imported, source_sha256=imported.file_hash, initiated_by=admin,
+        started_at=timezone.now(), worker_id="synthetic-worker-v2")
+    new_candidate = SavingsOpportunity.objects.create(plan_audit=audit, audit_run=new_run,
+        hcpcs_code="J9271", quarter="2026Q1", service_setting="outpatient_hospital",
+        current_site_npi="1000000004", alternative_site_npi="1000000012",
+        current_allowed_price_per_unit=100, alternative_allowed_price_per_unit=80,
+        units=10, potential_allowed_savings=200, network_status="IN_NETWORK", source_references=refs)
+    new_run.calculation_status = "completed"
+    new_run.completed_at = timezone.now()
+    new_run.result_fingerprint = run_result_fingerprint(new_run)
+    new_run.save(update_fields=["calculation_status", "completed_at", "result_fingerprint"])
+    audit.current_version = 2
+    audit.published_version = None
+    audit.save(update_fields=["current_version", "published_version"])
+    current = client.get(f"/api/v1/plan-audits/{audit.pk}/savings/")
+    assert current.status_code == 200
+    assert [row["id"] for row in current.json()["results"]] == [new_candidate.pk]
+    assert current.json()["results"][0]["review_decision"] is None
+

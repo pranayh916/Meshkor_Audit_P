@@ -2,10 +2,11 @@
 from datetime import date
 import hashlib
 import json
+from decimal import Decimal, InvalidOperation
 from django.shortcuts import get_object_or_404
 
 from .models import (
-    AuditReview, ClaimsSummaryImport, Plan, PlanAudit,
+    AuditReview, ClaimsSummaryImport, DrugUnitReview, Plan, PlanAudit,
     PlanAuditResult, PlanAuditRun, PlanOrganization, SavingsOpportunity,
 )
 from .permissions import (
@@ -89,6 +90,68 @@ def run_opportunities(run):
     return SavingsOpportunity.objects.filter(audit_run=run) if run else SavingsOpportunity.objects.none()
 
 
+def clinical_evidence_valid(run, hcpcs_codes=None, *, lock=False):
+    """Fail closed unless each requested code still has its exact clinical unit approval."""
+    if not run:
+        return False
+    rows = list(run_results(run).values_list("hcpcs_code", "data_quality_status", "source_references"))
+    if not rows:
+        return False
+    requested_codes = set(hcpcs_codes) if hcpcs_codes is not None else None
+    selected_codes = requested_codes if requested_codes is not None else {code for code, _, _ in rows}
+    evidence = {}
+    for code, quality, references in rows:
+        if code not in selected_codes:
+            continue
+        if quality != "VALID" or (references or {}).get("unit_review_status") != "validated":
+            return False
+        expected = (
+            references.get("unit_review_source_sha256"),
+            references.get("drug_selection_source_sha256"),
+            references.get("unit_review_billing_qty"),
+            references.get("unit_review_billing_unit"),
+        )
+        if any(value in (None, "") for value in expected):
+            return False
+        if code in evidence and evidence[code] != expected:
+            return False
+        evidence[code] = expected
+    if not evidence or (requested_codes is not None and requested_codes - set(evidence)):
+        return False
+    try:
+        from . import data
+        info = data.run_info()
+        current_scope_hash = info.get("drug_selection_source_sha256")
+        scope = data.drug_config()
+        if not current_scope_hash:
+            return False
+        query = DrugUnitReview.objects.filter(
+            hcpcs__in=evidence, scope_source_sha256=current_scope_hash,
+        ).order_by("hcpcs", "pk")
+        reviews = list(query.select_for_update() if lock else query)
+        reviews_by_code = {review.hcpcs: review for review in reviews}
+        for code, (review_hash, scope_hash, expected_qty, expected_unit) in evidence.items():
+            item = scope.get(code) or {}
+            unit = item.get("billing_unit") or {}
+            review = reviews_by_code.get(code)
+            if (scope_hash != current_scope_hash
+                    or item.get("selection_source_sha256") != scope_hash
+                    or not review or review.status != "validated" or not review.reviewer_id):
+                return False
+            try:
+                if (review.scope_source_sha256 != review_hash
+                        or Decimal(str(review.billing_qty)) != Decimal(str(expected_qty))
+                        or Decimal(str(unit.get("qty"))) != Decimal(str(expected_qty))
+                        or str(review.billing_unit).upper() != str(expected_unit).upper()
+                        or str(unit.get("unit", "")).upper() != str(expected_unit).upper()):
+                    return False
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+        return True
+    except (data.DataMissing, OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def run_result_fingerprint(run):
     result_rows = list(run_results(run).order_by("pk").values())
     savings_rows = list(run_opportunities(run).order_by("pk").values())
@@ -109,7 +172,8 @@ def published_run(audit):
         published_at__isnull=False,
     ).first()
     if (not run or not run.result_fingerprint or not run.report_fingerprint
-            or run_result_fingerprint(run) != run.result_fingerprint):
+            or run_result_fingerprint(run) != run.result_fingerprint
+            or not clinical_evidence_valid(run)):
         return None
     artifacts = {item.artifact_type: item for item in run.artifacts.all()}
     if set(artifacts) != {"pdf", "csv"}:

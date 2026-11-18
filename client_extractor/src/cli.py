@@ -18,7 +18,8 @@ from .processing.aggregate_claims import aggregate_claims
 from .processing.resolve_adjustments import resolve_claims
 from .readers import read_claims
 from .validation.claims_validator import (
-    HCPCS_PATTERN, OPTIONAL_FIELDS, REQUIRED_FIELDS, normalize_header, validate_claim,
+    HCPCS_PATTERN, OPTIONAL_FIELDS, REQUIRED_FIELDS, claim_chain_context,
+    normalize_header, validate_claim,
 )
 
 
@@ -110,7 +111,7 @@ def extract_claims(args):
 
     _archive_previous_export(args.output)
 
-    claims, errors, fingerprints = [], [], set()
+    claims, errors, fingerprints, quarantined = [], [], set(), []
     input_count = duplicate_count = invalid_count = 0
     try:
         for source_row, source in read_claims(args.claims, column_mapping):
@@ -119,12 +120,22 @@ def extract_claims(args):
                 raise ValueError(f"Input exceeds the {CLAIM_LIMIT:,}-record safety limit.")
             try:
                 normalized_source = _map_source_columns(source, column_mapping)
-                claim = validate_claim(normalized_source, source_row)
+                context = claim_chain_context(normalized_source, source_row)
+                try:
+                    claim = validate_claim(normalized_source, source_row)
+                except (ValueError, TypeError):
+                    if context:
+                        quarantined.append(context)
+                    raise
                 if claim["plan_id"] != plan_id:
+                    if context:
+                        quarantined.append(context)
                     raise ValueError("plan_id does not match the configured local plan")
                 fingerprint = _record_fingerprint(claim)
                 if fingerprint in fingerprints:
                     duplicate_count += 1
+                    if claim["claim_status"] in {"adjusted", "reversed"}:
+                        quarantined.append(context)
                     errors.append({"row": source_row, "category": "duplicate_exact_record",
                                    "reason": "Exact duplicate excluded."})
                     continue
@@ -146,7 +157,7 @@ def extract_claims(args):
     }
     for error in errors:
         quality["reasons"][error["category"]] = quality["reasons"].get(error["category"], 0) + 1
-    adjudicated = resolve_claims(claims, quality)
+    adjudicated = resolve_claims(claims, quality, quarantined=quarantined)
     dates = [claim["service_date"] for claim in claims]
     source_period = f"{min(dates).isoformat()}/{max(dates).isoformat()}" if dates else ""
     extracted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")

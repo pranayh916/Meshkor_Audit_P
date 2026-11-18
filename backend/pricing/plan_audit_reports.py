@@ -6,6 +6,7 @@ import json
 from collections import Counter
 
 from django.db import transaction
+from django.db.models import OuterRef, Subquery
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
@@ -13,10 +14,11 @@ from rest_framework.response import Response
 
 from pipeline.common import csv_safe_cell
 from .models import (AuditEvent, AuditReview, PlanAudit, PlanAuditArtifact,
-                     PlanAuditRun, PlanAuditResult, SavingsOpportunity)
+                     PlanAuditRun, PlanAuditResult, SavingsOpportunity,
+                     SavingsOpportunityReview)
 from .permissions import CanAnalyze, CanView, CanReview, has_any_role, SUPER_ADMIN_GROUP, REVIEWER_GROUP
 from .plan_audit_common import (current_audit_run, get_visible_audit, is_admin,
-    is_client_only, published_run, run_opportunities, run_results,
+    clinical_evidence_valid, is_client_only, published_run, run_opportunities, run_results,
     run_result_fingerprint)
 from .plan_audit_run import _calculation_fingerprint, _decimal_text, _visible_totals
 
@@ -28,6 +30,7 @@ def _admin_required(request):
 
 
 def _savings_payload(item, *, include_source_references=True):
+    decision = getattr(item, "latest_review_decision", None)
     payload = {
         "id": item.pk, "hcpcs_code": item.hcpcs_code, "quarter": item.quarter,
         "service_setting": item.service_setting, "current_site_npi": item.current_site_npi,
@@ -38,12 +41,15 @@ def _savings_payload(item, *, include_source_references=True):
         "potential_allowed_savings": _decimal_text(item.potential_allowed_savings),
         "potential_paid_difference": _decimal_text(item.potential_paid_difference),
         "network_status": item.network_status,
-        "clinical_review_status": item.clinical_review_status,
-        "validation_status": item.validation_status,
-        "label": "Potential allowed-amount savings; clinical review pending.",
+        "clinical_review_status": "approved" if decision == "approved" else item.clinical_review_status,
+        "validation_status": "validated" if decision == "approved" else item.validation_status,
+        "review_decision": decision,
+        "label": ("Reviewed potential savings; disposition recorded for this audit version."
+                  if decision else "Potential allowed-amount savings; review pending."),
     }
     if include_source_references:
         payload["source_references"] = item.source_references
+        payload["review_reason"] = getattr(item, "latest_review_reason", None)
     return payload
 
 
@@ -67,12 +73,76 @@ def _paged_response(request, queryset, serialize, *, default_limit=200, max_limi
 def audit_savings(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
     rows = run_opportunities(current_audit_run(audit))
+    latest = SavingsOpportunityReview.objects.filter(
+        opportunity_id=OuterRef("pk"),
+    ).order_by("-created_at", "-pk")
+    rows = rows.annotate(
+        latest_review_decision=Subquery(latest.values("decision")[:1]),
+        latest_review_reason=Subquery(latest.values("reason")[:1]),
+    )
     if is_client_only(request.user):
-        rows = rows.filter(validation_status="validated", clinical_review_status__in=("approved", "validated"))
+        rows = rows.filter(latest_review_decision="approved")
     return _paged_response(
         request, rows.order_by("pk"),
         lambda row: _savings_payload(row, include_source_references=not is_client_only(request.user)),
     )
+
+
+@api_view(["POST"])
+@permission_classes([CanReview])
+def review_savings_opportunity(request, audit_id, opportunity_id):
+    if not has_any_role(request.user, {SUPER_ADMIN_GROUP, REVIEWER_GROUP}):
+        return Response({"error": "Only a Reviewer or Super Admin can disposition savings opportunities."}, status=403)
+    audit = get_visible_audit(request.user, audit_id)
+    decision = str(request.data.get("decision", "")).strip()
+    if decision not in {"approved", "rejected", "not_actionable"}:
+        return Response({"error": "decision must be approved, rejected, or not_actionable."}, status=400)
+    reason = str(request.data.get("reason", "")).strip()
+    if not reason or len(reason) > 2000:
+        return Response({"error": "Provide a reason of 1 to 2,000 characters for the disposition."}, status=400)
+    evidence_keys = request.data.get("evidence_references")
+    if (not isinstance(evidence_keys, list) or not evidence_keys
+            or len(evidence_keys) > 20
+            or any(not isinstance(key, str) for key in evidence_keys)
+            or len(set(evidence_keys)) != len(evidence_keys)):
+        return Response({"error": "Select one or more unique source evidence references."}, status=400)
+
+    with transaction.atomic():
+        audit = PlanAudit.objects.select_for_update().select_related("summary_import").get(pk=audit.pk)
+        run = PlanAuditRun.objects.select_for_update().filter(
+            plan_audit_id=audit.pk, version=audit.current_version,
+        ).first()
+        if (not run or run.calculation_status != "completed"
+                or request.data.get("version") != run.version
+                or request.data.get("result_fingerprint") != run.result_fingerprint
+                or run_result_fingerprint(run) != run.result_fingerprint):
+            return Response({"error": "The audit version or its results changed; review the current version."}, status=409)
+        opportunity = SavingsOpportunity.objects.select_for_update().filter(
+            pk=opportunity_id, plan_audit_id=audit.pk, audit_run_id=run.pk,
+        ).first()
+        if not opportunity:
+            return Response({"error": "This opportunity does not belong to the current audit version."}, status=404)
+        references = opportunity.source_references or {}
+        if any(key not in references or references[key] in (None, "", []) for key in evidence_keys):
+            return Response({"error": "Evidence references must identify source evidence attached to this opportunity."}, status=400)
+        if decision == "approved":
+            required = {"claims_summary_sha256", "network_roster_file_hashes"}
+            if (opportunity.network_status != "IN_NETWORK" or required - set(evidence_keys)
+                    or not clinical_evidence_valid(run, {opportunity.hcpcs_code}, lock=True)):
+                return Response({"error": "Approval requires current clinical unit approval and the opportunity's claims and network evidence."}, status=409)
+        evidence = [{"key": key, "value": references[key]} for key in sorted(evidence_keys)]
+        review = SavingsOpportunityReview.objects.create(
+            opportunity=opportunity, audit_run=run, reviewer=request.user,
+            decision=decision, reason=reason, evidence_references=evidence,
+        )
+        AuditEvent.objects.create(actor=request.user, action="savings_opportunity_reviewed",
+            entity_type="savings_opportunity", entity_id=str(opportunity.pk),
+            details={"audit_id": audit.pk, "version": run.version, "decision": decision,
+                     "evidence_keys": sorted(evidence_keys)})
+    return Response({"id": review.pk, "opportunity_id": opportunity.pk,
+        "version": run.version, "decision": decision, "reason": review.reason,
+        "evidence_references": review.evidence_references, "reviewer": request.user.get_username(),
+        "created_at": review.created_at}, status=201)
 
 
 @api_view(["GET"])
@@ -325,6 +395,10 @@ def _set_review(request, audit_id, status):
             return Response({"error": "This run has already received a final publication decision."}, status=409)
         artifacts = {obj.artifact_type: obj for obj in run.artifacts.all()}
         if status == "approved":
+            if not clinical_evidence_valid(run, lock=True):
+                return Response({
+                    "error": "Current clinical unit approvals no longer match this audit version's exact evidence and scope. Recalculate and review a current version before publication."
+                }, status=409)
             if not audit.created_by_id or not run.initiated_by_id:
                 return Response({
                     "error": "Approval is unavailable because this audit's creator or run initiator identity is missing."

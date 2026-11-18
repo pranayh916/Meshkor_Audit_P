@@ -39,6 +39,8 @@ urlpatterns = [
          name="plan_audit_hospital_comparison"),
     path("plan-audits/<int:audit_id>/asp-benchmark/", run.asp_benchmark, name="plan_audit_asp_benchmark"),
     path("plan-audits/<int:audit_id>/savings/", reports.audit_savings, name="plan_audit_savings"),
+    path("plan-audits/<int:audit_id>/savings/<int:opportunity_id>/review/",
+         reports.review_savings_opportunity, name="plan_audit_savings_review"),
     path("plan-audits/<int:audit_id>/network-validation/", reports.audit_network_validation,
          name="plan_audit_network_validation"),
     path("plan-audits/<int:audit_id>/quality/", reports.audit_quality, name="plan_audit_quality"),
