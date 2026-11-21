@@ -52,6 +52,7 @@ export default function UserManagement({ user }) {
     finally { setBusy(""); }
   }
 
+  return (
     <div className="user-management-page">
       <header className="page-header">
         <div>
@@ -75,91 +76,90 @@ export default function UserManagement({ user }) {
           <form onSubmit={createAccount} style={{ display: "grid", gap: "14px" }}>
             <div style={{ display: "grid", gap: "6px" }}>
               <label style={{ fontSize: "12px", fontWeight: "600", textTransform: "uppercase", letterSpacing: "0.04em" }}>Username *</label>
-              <input name="username" autoComplete="off" required maxLength={150} style={{ padding: "8px 12px", borderRadius: "6px", border: "1px solid var(--line)" }} />
+              <input name="username" autoComplete="off" required maxLength={150} placeholder="e.g. jsmith" style={{ padding: "8px 12px", borderRadius: "6px" }} />
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
               <div style={{ display: "grid", gap: "6px" }}>
                 <label style={{ fontSize: "12px", fontWeight: "600", textTransform: "uppercase", letterSpacing: "0.04em" }}>First Name</label>
-                <input name="first_name" maxLength={150} style={{ padding: "8px 12px", borderRadius: "6px", border: "1px solid var(--line)" }} />
+                <input name="first_name" maxLength={150} placeholder="Jane" style={{ padding: "8px 12px", borderRadius: "6px" }} />
               </div>
               <div style={{ display: "grid", gap: "6px" }}>
                 <label style={{ fontSize: "12px", fontWeight: "600", textTransform: "uppercase", letterSpacing: "0.04em" }}>Last Name</label>
-                <input name="last_name" maxLength={150} style={{ padding: "8px 12px", borderRadius: "6px", border: "1px solid var(--line)" }} />
+                <input name="last_name" maxLength={150} placeholder="Smith" style={{ padding: "8px 12px", borderRadius: "6px" }} />
               </div>
             </div>
 
             <div style={{ display: "grid", gap: "6px" }}>
               <label style={{ fontSize: "12px", fontWeight: "600", textTransform: "uppercase", letterSpacing: "0.04em" }}>Email Address</label>
-              <input name="email" type="email" maxLength={254} style={{ padding: "8px 12px", borderRadius: "6px", border: "1px solid var(--line)" }} />
+              <input name="email" type="email" maxLength={254} placeholder="jsmith@example.com" style={{ padding: "8px 12px", borderRadius: "6px" }} />
             </div>
 
             <div style={{ display: "grid", gap: "6px" }}>
-              <label style={{ fontSize: "12px", fontWeight: "600", textTransform: "uppercase", letterSpacing: "0.04em" }}>Role Assignment *</label>
-              <select name="role" defaultValue="CLIENT" style={{ padding: "8px 12px", borderRadius: "6px", border: "1px solid var(--line)" }}>
-                <option value="SUPER_ADMIN">Super Admin (Full Access)</option>
-                <option value="ANALYST">Analyst (Ingestion & Pipelines)</option>
-                <option value="REVIEWER">Reviewer (Audit Approvals)</option>
-                <option value="CLIENT">Client (Approved Audits Only)</option>
+              <label style={{ fontSize: "12px", fontWeight: "600", textTransform: "uppercase", letterSpacing: "0.04em" }}>Role *</label>
+              <select name="role" defaultValue="CLIENT" style={{ padding: "8px 12px", borderRadius: "6px", width: "100%" }}>
+                <option value="SUPER_ADMIN">Super Admin (Full Platform Access)</option>
+                <option value="ANALYST">Analyst (Ingest, Claims, Run Audits)</option>
+                <option value="REVIEWER">Reviewer (Sign-Off & Clinical Queue)</option>
+                <option value="CLIENT">Client (View Plan Audits & Reports)</option>
               </select>
             </div>
 
             <div style={{ display: "grid", gap: "6px" }}>
               <label style={{ fontSize: "12px", fontWeight: "600", textTransform: "uppercase", letterSpacing: "0.04em" }}>Initial Password *</label>
-              <input name="password" type="password" autoComplete="new-password" required minLength={10} placeholder="Min 10 characters" style={{ padding: "8px 12px", borderRadius: "6px", border: "1px solid var(--line)" }} />
+              <input name="password" type="password" autoComplete="new-password" required minLength={10} placeholder="At least 10 characters" style={{ padding: "8px 12px", borderRadius: "6px" }} />
+              <small className="muted" style={{ fontSize: "11px" }}>User will be required to set up 2FA Google Authenticator at first login.</small>
             </div>
 
-            <button className="button" disabled={busy === "create"} style={{ marginTop: "8px", width: "100%", padding: "10px" }}>
-              {busy === "create" ? "Creating Account…" : "Create User Account"}
+            <button type="submit" className="button" disabled={busy === "create"} style={{ marginTop: "8px", padding: "10px 16px", fontWeight: "600" }}>
+              {busy === "create" ? "Creating Account…" : "Create Account"}
             </button>
           </form>
-
-          <p className="muted" style={{ fontSize: "12px", marginTop: "14px", lineHeight: 1.4 }}>
-            ℹ️ Passwords must be at least 10 characters. Two-factor authentication (MFA) will be configured on initial sign-in.
-          </p>
         </section>
 
-        {/* Right Column: Existing Users */}
+        {/* Right Column: Existing Users Table */}
         <section className="dashboard-panel" style={{ background: "var(--panel)", border: "1px solid var(--line)", borderRadius: "12px", padding: "24px" }}>
-          <div className="panel-header" style={{ marginBottom: "16px" }}>
-            <h2 style={{ fontSize: "18px", margin: "0 0 6px" }}>Platform Users</h2>
-            <p className="muted" style={{ fontSize: "13px", margin: 0 }}>Registered accounts and assigned role privileges.</p>
+          <div className="panel-header" style={{ marginBottom: "16px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <h2 style={{ fontSize: "18px", margin: "0 0 6px" }}>Application Accounts</h2>
+              <p className="muted" style={{ fontSize: "13px", margin: 0 }}>Active user accounts and assigned roles.</p>
+            </div>
+            <button type="button" className="button-subtle" onClick={() => setVersion((v) => v + 1)} style={{ fontSize: "12px" }}>↻ Refresh</button>
           </div>
 
           <Loading state={accounts}>
             {(rows) => (
-              <div style={{ overflowX: "auto" }}>
-                <table className="comparison-table" style={{ width: "100%", borderCollapse: "collapse" }}>
+              <div className="table-wrap" style={{ overflowX: "auto" }}>
+                <table className="executive-table" style={{ width: "100%", borderCollapse: "collapse" }}>
                   <thead>
-                    <tr style={{ borderBottom: "2px solid var(--line)", textAlign: "left" }}>
-                      <th style={{ padding: "10px" }}>User</th>
-                      <th style={{ padding: "10px" }}>Role</th>
-                      <th style={{ padding: "10px" }}>Status</th>
-                      <th style={{ padding: "10px" }}>Last Login</th>
-                      <th style={{ padding: "10px", textAlign: "right" }}>Actions</th>
+                    <tr>
+                      <th style={{ textAlign: "left", padding: "10px" }}>User</th>
+                      <th style={{ textAlign: "left", padding: "10px" }}>Role</th>
+                      <th style={{ textAlign: "center", padding: "10px" }}>Status</th>
+                      <th style={{ textAlign: "left", padding: "10px" }}>Last Login</th>
+                      <th style={{ textAlign: "right", padding: "10px" }}>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
                     {rows.map((r) => {
                       const roleName = r.roles?.[0] || "CLIENT";
+                      const roleBadgeClass =
+                        roleName === "SUPER_ADMIN" ? "validated" :
+                        roleName === "ANALYST" ? "ready" :
+                        roleName === "REVIEWER" ? "pending" : "neutral";
+
                       return (
                         <tr key={r.id} style={{ borderBottom: "1px solid var(--line)" }}>
                           <td style={{ padding: "12px 10px" }}>
-                            <div style={{ fontWeight: "600", color: "var(--ink)" }}>{r.username}</div>
-                            <div style={{ fontSize: "12px", color: "var(--muted)" }}>
-                              {r.display_name || "—"} {r.email ? `• ${r.email}` : ""}
-                            </div>
+                            <div style={{ fontWeight: "600", color: "var(--ink)" }}>{r.display_name || r.username}</div>
+                            <div className="muted" style={{ fontSize: "12px" }}>@{r.username} {r.email ? `· ${r.email}` : ""}</div>
                           </td>
                           <td style={{ padding: "12px 10px" }}>
-                            <span className="role-tag" style={{
-                              display: "inline-block", padding: "3px 8px", borderRadius: "4px", fontSize: "11px", fontWeight: "600",
-                              background: roleName === "SUPER_ADMIN" ? "#fef3c7" : roleName === "ANALYST" ? "#e0e7ff" : roleName === "REVIEWER" ? "#fce7f3" : "#f3f4f6",
-                              color: roleName === "SUPER_ADMIN" ? "#92400e" : roleName === "ANALYST" ? "#3730a3" : roleName === "REVIEWER" ? "#9d174d" : "#374151"
-                            }}>
+                            <span className={`status-tag ${roleBadgeClass}`} style={{ fontSize: "11px", fontWeight: "600", padding: "3px 8px", borderRadius: "4px" }}>
                               {roleName.replace("_", " ")}
                             </span>
                           </td>
-                          <td style={{ padding: "12px 10px" }}>
+                          <td style={{ padding: "12px 10px", textAlign: "center" }}>
                             <span style={{
                               display: "inline-block", width: "8px", height: "8px", borderRadius: "50%",
                               background: r.is_active ? "#10b981" : "#ef4444", marginRight: "6px"
@@ -245,5 +245,6 @@ export default function UserManagement({ user }) {
           </Loading>
         </section>
       </div>
-    </div>;
+    </div>
+  );
 }
