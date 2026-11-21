@@ -218,9 +218,16 @@ def load_nppes() -> bool:
         pl.lit(None, dtype=pl.Date).alias("effective_start"),
         pl.lit(rel(source)).alias("source_file"), pl.lit(source_hash).alias("source_sha256"),
     )
-    count = _write_atomic(frame, paths()["ref"] / REFERENCE_ARTIFACTS["providers"])
-    print(f"NPPES: {count:,} {state_code} Type 2 providers in configured hospital taxonomies; source SHA-256 {source_hash}")
-    return True
+    target = paths()["ref"] / REFERENCE_ARTIFACTS["providers"]
+    try:
+        count = _write_atomic(frame, target)
+        print(f"NPPES: {count:,} {state_code} Type 2 providers in configured hospital taxonomies; source SHA-256 {source_hash}")
+        return True
+    except ValueError:
+        if target.is_file():
+            print(f"NPPES: {source.name} yielded no new matching providers; existing Parquet table preserved")
+            return False
+        raise
 
 
 def load_hospital_enrollments() -> bool:
