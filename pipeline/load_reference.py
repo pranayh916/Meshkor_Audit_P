@@ -187,6 +187,7 @@ def load_nppes() -> bool:
         pl.col("Provider Last Name (Legal Name)"),
     ], separator=" ", ignore_nulls=True).str.strip_chars()
     practice_state = pl.col("Provider Business Practice Location Address State Name").str.strip_chars().str.to_uppercase()
+    mailing_state = pl.col("Provider Business Mailing Address State Name").str.strip_chars().str.to_uppercase()
     practice_zip3 = pl.col("Provider Business Practice Location Address Postal Code").str.strip_chars().str.extract(r"^(\d{3})", 1)
     geography = load_yaml("geography.yaml")
     hospital_taxonomies = load_yaml("hospital_taxonomies.yaml")
