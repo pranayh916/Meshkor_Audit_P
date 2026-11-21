@@ -25,7 +25,8 @@ export const ROLE_POLICY = {
   client: ["CLIENT"],
   planAudits: ["SUPER_ADMIN", "ANALYST", "REVIEWER", "CLIENT"],
   claims: ["SUPER_ADMIN", "ANALYST"],
-  drugScope: ["SUPER_ADMIN", "REVIEWER"],
+  drugScope: ["SUPER_ADMIN", "ANALYST", "REVIEWER"],
+  quality: ["SUPER_ADMIN", "ANALYST"],
   market: ["SUPER_ADMIN", "ANALYST", "REVIEWER", "CLIENT"],
   account: ["SUPER_ADMIN", "ANALYST", "REVIEWER", "CLIENT"],
 };
