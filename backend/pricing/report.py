@@ -53,7 +53,7 @@ def build_pdf(signoff: dict, codes: list[str] | None = None, user: str | None = 
                 predicate += " AND (status IN ('ok', 'review_range') OR coalesce(reviewed, false))"
             details = connection.execute(
                 f"SELECT {', '.join(detail_fields)}, hcpcs FROM read_parquet(?) "
-                f"WHERE {predicate} ORDER BY hcpcs, hospital_label, payer_group, setting, price_type",
+                f"WHERE {predicate} ORDER BY hcpcs, hospital_label, payer_group, setting, price_type LIMIT 2500",
                 [comparison.as_posix(), sorted(selected)]).fetchall()
         else:
             details = []
