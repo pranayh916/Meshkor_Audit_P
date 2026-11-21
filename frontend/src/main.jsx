@@ -238,37 +238,51 @@ function Shell({ user, onLogout, theme, onToggleTheme }) {
             <span /><span /><span />
           </button>
         </div>
-        <div className="sidebar-group"><span className="sidebar-label">AUDIT PLATFORM</span><nav id="primary-navigation" aria-label="Main navigation">
+        <div className="sidebar-group"><span className="sidebar-label">NAVIGATION</span><nav id="primary-navigation" aria-label="Main navigation">
+          {/* Universal Overview */}
           <NavLink to="/" end><span aria-hidden="true">◫</span><span className="nav-label">Overview</span></NavLink>
-          {canAccess(user, "market") && <NavLink to="/hospitals"><span aria-hidden="true">⌂</span><span className="nav-label">Hospitals</span></NavLink>}
-          {canAccess(user, "drugScope") && <NavLink to="/drug-selection-scope"><span aria-hidden="true">#</span><span className="nav-label">Drug Scope</span></NavLink>}
-          {canAccess(user, "market") && <NavLink to="/hospital-drug-price-comparisons"><span aria-hidden="true">↗</span><span className="nav-label">Comparisons</span></NavLink>}
-          {canAccess(user, "planAudits") && <NavLink to="/plan-specific-audits"><span aria-hidden="true">◉</span><span className="nav-label">{hasRole(user, "REVIEWER") && !hasRole(user, "ANALYST", "SUPER_ADMIN") ? "Review Queue" : "Plan Audits"}</span></NavLink>}
-          {canAccess(user, "claims") && <NavLink to="/claims-explorer"><span aria-hidden="true">▦</span><span className="nav-label">Claims Explorer</span></NavLink>}
-          {canAccess(user, "market") && <NavLink to="/reports"><span aria-hidden="true">▧</span><span className="nav-label">Reports</span></NavLink>}
-          <details className="sidebar-more">
-            <summary><span aria-hidden="true">•••</span><span className="nav-label">More</span></summary>
-            <div className="sidebar-subnav">
-              <NavLink to="/methodology">Methodology</NavLink>
-              {canAccess(user, "analyst") && <>
-                <NavLink to="/hospital-price-transparency-files">Hospital Price Files</NavLink>
-                <NavLink to="/reference-data-sets">Reference Data Sets</NavLink>
-                <NavLink to="/hospital-file-quality">Hospital File Quality</NavLink>
-              </>}
-              {canAccess(user, "analyst") && <>
-                <NavLink to="/data-sources">Data Sources & Import</NavLink>
-              </>}
-              {canAccess(user, "reviewer") && <>
-                <NavLink to="/drug-selection-scope">Drug Scope</NavLink>
-                <NavLink to="/drug-unit-validations">{hasRole(user, "REVIEWER") ? "Review Queue · Drug Units" : "Drug Unit Review"}</NavLink>
-              </>}
-              {canAccess(user, "admin") && <>
-                <NavLink to="/audit-logs">Audit Logs</NavLink>
-                <NavLink to="/user-management">User Management</NavLink>
-              </>}
-              <NavLink to="/application-settings">{canAccess(user, "admin") ? "Application Settings" : "Account Security"}</NavLink>
-            </div>
-          </details>
+
+          {/* SUPER ADMIN: Core tools */}
+          {hasRole(user, "SUPER_ADMIN", "Admin") && <>
+            <NavLink to="/hospital-drug-price-comparisons"><span aria-hidden="true">↗</span><span className="nav-label">Price Comparisons</span></NavLink>
+            <NavLink to="/plan-specific-audits"><span aria-hidden="true">◉</span><span className="nav-label">Plan Audits</span></NavLink>
+            <NavLink to="/hospitals"><span aria-hidden="true">⌂</span><span className="nav-label">Hospitals</span></NavLink>
+            <NavLink to="/claims-explorer"><span aria-hidden="true">▦</span><span className="nav-label">Claims Explorer</span></NavLink>
+            <NavLink to="/reports"><span aria-hidden="true">▧</span><span className="nav-label">Reports</span></NavLink>
+            <NavLink to="/user-management"><span aria-hidden="true">👤</span><span className="nav-label">User Management</span></NavLink>
+            <NavLink to="/audit-logs"><span aria-hidden="true">📋</span><span className="nav-label">Audit Logs</span></NavLink>
+            <NavLink to="/application-settings"><span aria-hidden="true">⚙</span><span className="nav-label">Platform Settings</span></NavLink>
+          </>}
+
+          {/* ANALYST: Ingest & analyze */}
+          {hasRole(user, "ANALYST") && !hasRole(user, "SUPER_ADMIN", "Admin") && <>
+            <NavLink to="/claims-explorer"><span aria-hidden="true">▦</span><span className="nav-label">Claims Explorer</span></NavLink>
+            <NavLink to="/plan-specific-audits"><span aria-hidden="true">◉</span><span className="nav-label">Plan Audits</span></NavLink>
+            <NavLink to="/hospital-drug-price-comparisons"><span aria-hidden="true">↗</span><span className="nav-label">Price Comparisons</span></NavLink>
+            <NavLink to="/drug-selection-scope"><span aria-hidden="true">#</span><span className="nav-label">Drug Scope</span></NavLink>
+            <NavLink to="/data-sources"><span aria-hidden="true">🗄</span><span className="nav-label">Data Sources & Pipeline</span></NavLink>
+            <NavLink to="/reports"><span aria-hidden="true">▧</span><span className="nav-label">Reports</span></NavLink>
+          </>}
+
+          {/* REVIEWER: Quality & clinical reviews */}
+          {hasRole(user, "REVIEWER") && !hasRole(user, "SUPER_ADMIN", "Admin") && <>
+            <NavLink to="/drug-unit-validations"><span aria-hidden="true">⚖</span><span className="nav-label">Review Queue · Drug Units</span></NavLink>
+            <NavLink to="/plan-specific-audits"><span aria-hidden="true">◉</span><span className="nav-label">Audit Review & Sign-Off</span></NavLink>
+            <NavLink to="/hospital-drug-price-comparisons"><span aria-hidden="true">↗</span><span className="nav-label">Price Comparisons</span></NavLink>
+            <NavLink to="/reports"><span aria-hidden="true">▧</span><span className="nav-label">Reports & Release</span></NavLink>
+          </>}
+
+          {/* CLIENT: Ultra-clean employer portal */}
+          {isClientOnly(user) && <>
+            <NavLink to="/plan-specific-audits"><span aria-hidden="true">◉</span><span className="nav-label">My Plan Audits</span></NavLink>
+            <NavLink to="/reports"><span aria-hidden="true">📄</span><span className="nav-label">Download Reports</span></NavLink>
+          </>}
+
+          {/* Settings / Security link */}
+          {!hasRole(user, "SUPER_ADMIN", "Admin") && (
+            <NavLink to="/application-settings"><span aria-hidden="true">🔒</span><span className="nav-label">Account Security</span></NavLink>
+          )}
+
         </nav></div>
         <button className="collapse-button" type="button" onClick={() => setCollapsed((v) => !v)} aria-expanded={!collapsed}>{collapsed ? "›" : "‹"}{!collapsed && " Collapse menu"}</button>
       </aside>
