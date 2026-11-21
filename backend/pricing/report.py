@@ -48,6 +48,9 @@ def build_pdf(signoff: dict, codes: list[str] | None = None, user: str | None = 
             if viewer_safe:
                 predicate += (" AND coalesce(reviewed, false) AND status NOT IN "
                               "('unit_unresolved','unit_ambiguous','billing_unit_mismatch')")
+            else:
+                # Include qualifying and review rates, skip pure unresolvable raw rows from 10,000+ page appendix
+                predicate += " AND (status IN ('ok', 'review_range') OR coalesce(reviewed, false))"
             details = connection.execute(
                 f"SELECT {', '.join(detail_fields)}, hcpcs FROM read_parquet(?) "
                 f"WHERE {predicate} ORDER BY hcpcs, hospital_label, payer_group, setting, price_type",
